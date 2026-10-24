@@ -44,6 +44,7 @@ from nervos_core.application.sandbox import (
 from nervos_core.application.tool_catalog import ToolSourceSynchronizer, gather_descriptors
 from nervos_core.application.tool_invocation_mediator import ToolInvocationMediator
 from nervos_core.application.tool_invocations import ClaimHandle
+from nervos_core.application.tool_permissions import ToolPermissionPersistence
 from nervos_core.application.tool_registry import ToolRegistry
 from nervos_core.application.trusted_chat import ChatOutcome
 from nervos_core.application.workflows import (
@@ -102,6 +103,7 @@ class PackageExecutionAdapter:
         trust: PublisherTrustService | None = None,
         workflow_steps: WorkflowStepSnapshotSource | None = None,
         containment_factory: Callable[[], PackageContainment] = create_containment,
+        tool_permissions: ToolPermissionPersistence | None = None,
     ) -> None:
         self._store = package_store.expanduser().resolve(strict=False)
         self._mediator = mediator
@@ -112,6 +114,7 @@ class PackageExecutionAdapter:
         self._trust = trust
         self._workflow_steps: WorkflowStepSnapshotSource | None = workflow_steps
         self._containment_factory = containment_factory
+        self._tool_permissions = tool_permissions
 
     async def run(
         self,
@@ -132,6 +135,9 @@ class PackageExecutionAdapter:
             raise ModelProviderError(INTERNAL_EXECUTION_ERROR)
         declared_tools: frozenset[str] = frozenset()
         integration = PackageIntegration()
+        manifest = None
+        runtime_kind = "python"
+        runtime_command: list[str] = []
         if self._packages is not None:
             try:
                 if self._trust is not None:
@@ -150,6 +156,8 @@ class PackageExecutionAdapter:
                     raise ValueError("pinned package manifest identity does not match the Run")
                 declared_tools = frozenset((*manifest.tools.required, *manifest.tools.optional))
                 integration = package_integration(manifest)
+                runtime_kind = manifest.runtime.kind
+                runtime_command = list(manifest.runtime.command)
             except Exception as error:
                 raise ModelProviderError(INTERNAL_EXECUTION_ERROR) from error
         pinned = self._integrations.bindings_for_run(run.id) if self._integrations else []
@@ -190,8 +198,26 @@ class PackageExecutionAdapter:
             dir=scratch_root,
         )
         scratch = Path(scratch_directory.name)
+
+        # Compute package bundle root for process kind
+        package_root: Path | None = None
+        if runtime_kind == "process" and manifest is not None:
+            package_id = manifest.package_id.replace(".", "_")
+            package_version = manifest.package_version.replace("+", "_")
+            package_root = (
+                self._store
+                / "packages"
+                / package_id
+                / package_version
+                / cast(str, executable.package_content_digest)
+            )
+            if not package_root.is_dir():
+                raise ModelProviderError(INTERNAL_EXECUTION_ERROR)
+
         try:
-            process = await _spawn_host(containment, python, scratch)
+            process = await _spawn_host(
+                containment, python, scratch, runtime_kind, runtime_command, package_root
+            )
         except BaseException:
             scratch_directory.cleanup()
             raise
@@ -235,16 +261,37 @@ class PackageExecutionAdapter:
             refusal = _host_capability_refusal(integration, workflow_snapshot, features)
             if refusal is not None:
                 raise refusal
-            await _write_frame(
-                process.stdin,
-                _message(
-                    "initialize",
-                    "initialize",
-                    {
-                        "entrypoint": executable.package_entrypoint,
-                    },
-                ),
-            )
+            if runtime_kind == "process":
+                # Tools list comes from granted tools at the host level. Currently
+                # the Worker does not track granted tools per run in a way that
+                # can be queried here, so we pass an empty list. The shim's
+                # tools/list will return empty until tool grant tracking is wired
+                # into the package execution path.
+                tools_info = []
+                await _write_frame(
+                    process.stdin,
+                    _message(
+                        "initialize",
+                        "initialize",
+                        {
+                            "runtime_kind": "process",
+                            "command": runtime_command,
+                            "tools": tools_info,
+                            "package_root": str(package_root) if package_root is not None else None,
+                        },
+                    ),
+                )
+            else:
+                await _write_frame(
+                    process.stdin,
+                    _message(
+                        "initialize",
+                        "initialize",
+                        {
+                            "entrypoint": executable.package_entrypoint,
+                        },
+                    ),
+                )
             ready = await asyncio.wait_for(read_host_frame(), _HOST_START_TIMEOUT)
             if ready["type"] != "ready":
                 raise HostProtocolError("package host did not become ready")
@@ -726,14 +773,22 @@ def _workflow_step_result(
 
 
 async def _spawn_host(
-    containment: PackageContainment, python: Path, scratch: Path
+    containment: PackageContainment,
+    python: Path,
+    scratch: Path,
+    runtime_kind: str = "python",
+    runtime_command: list[str] | None = None,
+    package_root: Path | None = None,
 ) -> asyncio.subprocess.Process:
     """Start the package host from a containment-owned pre-exec launch specification."""
+    # For process kind, the python argument is not used for the agent
+    # but the host still runs on Python
     launch = containment.prepare(
         python=python,
         scratch=scratch,
         environment=package_host_environment(),
         arguments=("-m", "nervos_package_host"),
+        package_root=package_root,
     )
     if os.name == "nt":
         return await asyncio.create_subprocess_exec(

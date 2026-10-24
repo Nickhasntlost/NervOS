@@ -7,8 +7,11 @@ import asyncio
 import contextlib
 import io
 import json
+import os
+import secrets
 import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import BinaryIO, cast
 
 from nervos_sdk import (
@@ -27,6 +30,7 @@ from nervos_sdk import (
 )
 from nervos_sdk.types import JSONValue
 
+from nervos_package_host.bridge_shim import ShimConfig, ShimServer
 from nervos_package_host.runner import (
     HostEntrypointError,
     SerializedModelPort,
@@ -176,6 +180,90 @@ def _nonnegative_int(value: object, field: str) -> int:
     return value
 
 
+async def _run_process_agent(
+    protocol_in: BinaryIO,
+    protocol_out: BinaryIO,
+    command: list[str],
+    package_root: Path,
+) -> None:
+    """Run a generic process agent with the loopback shim."""
+    token = secrets.token_urlsafe(32)
+    config = ShimConfig(token=token, request_timeout=60.0, max_requests=1000)
+
+    async def forward_wire_message(message: dict[str, object]) -> None:
+        """No-op hook; response routing happens inside ShimServer._read_loop."""
+
+    # Read run_request before starting the shim reader so the two never compete
+    # for the same stdin bytes.
+    request = read_frame(protocol_in)
+    if request["type"] != "run_request":
+        raise HostProtocolError("host expected run_request")
+    payload = cast(dict[str, object], request["payload"])
+    input_text = cast(str, payload.get("input_text", ""))
+
+    # Start the shim server
+    shim_server = ShimServer(config, protocol_in, protocol_out, forward_wire_message)
+    shim_server.start()
+    port = shim_server.port
+
+    # Prepare environment for the child process
+    env = os.environ.copy()
+    env.update(
+        {
+            "OPENAI_BASE_URL": f"http://127.0.0.1:{port}/v1",
+            "OPENAI_API_KEY": token,
+            "NERVOS_MCP_URL": f"http://127.0.0.1:{port}/mcp",
+        }
+    )
+
+    # Spawn the child process
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=package_root,
+        env=env,
+    )
+
+    # Send input to child's stdin
+    if process.stdin is not None:
+        process.stdin.write(json.dumps({"input": input_text}).encode("utf-8"))
+        await process.stdin.drain()
+        process.stdin.close()
+
+    # Wait for process to complete
+    stdout_data, stderr_data = await process.communicate()
+
+    # Stop the shim
+    await shim_server.stop()
+
+    request_id = str(request["request_id"])
+    if process.returncode == 0:
+        output = stdout_data.decode("utf-8", errors="replace").strip()
+        result_payload: dict[str, object] = {
+            "final_message": output,
+            "output": {},
+            "metadata": {},
+            "memory_proposals": [],
+            "workflow": None,
+        }
+        write_frame(
+            protocol_out,
+            _message("run_result", request_id, result_payload),
+        )
+    else:
+        error_output = stderr_data.decode("utf-8", errors="replace")[:4096]
+        error_payload: dict[str, object] = {
+            "code": "process_agent_failed",
+            "message": error_output,
+        }
+        write_frame(
+            protocol_out,
+            _message("run_error", request_id, error_payload),
+        )
+
+
 async def _run_session(protocol_in: BinaryIO, protocol_out: BinaryIO, entrypoint: str) -> None:
     """Run one entrypoint with worker-mediated ports on the canonical framed wire."""
     next_request = 0
@@ -312,13 +400,33 @@ def main() -> int:
         if initialize["type"] != "initialize":
             raise HostProtocolError("host expected initialize")
         payload = cast("dict[str, object]", initialize["payload"])
-        entrypoint = payload.get("entrypoint")
-        if not isinstance(entrypoint, str):
-            raise HostProtocolError("initialize requires entrypoint")
-        health_check(entrypoint)
-        write_frame(protocol_out, _message("ready", str(initialize["request_id"]), {}))
-        asyncio.run(_run_session(protocol_in, protocol_out, entrypoint))
-        return 0
+        runtime_kind = payload.get("runtime_kind", "python")
+        if runtime_kind == "process":
+            command_raw = payload.get("command")
+            if not isinstance(command_raw, list):
+                raise HostProtocolError("initialize requires command list for process kind")
+            command_items = cast("list[object]", command_raw)
+            if not all(isinstance(item, str) for item in command_items):
+                raise HostProtocolError("initialize requires command list for process kind")
+            command = cast("list[str]", command_items)
+            package_root_raw = payload.get("package_root")
+            if isinstance(package_root_raw, str):
+                package_root = Path(package_root_raw)
+            else:
+                package_root = Path.cwd()
+            if not package_root.is_dir():
+                raise HostProtocolError("package_root does not exist or is not a directory")
+            write_frame(protocol_out, _message("ready", str(initialize["request_id"]), {}))
+            asyncio.run(_run_process_agent(protocol_in, protocol_out, command, package_root))
+            return 0
+        else:
+            entrypoint = payload.get("entrypoint")
+            if not isinstance(entrypoint, str):
+                raise HostProtocolError("initialize requires entrypoint")
+            health_check(entrypoint)
+            write_frame(protocol_out, _message("ready", str(initialize["request_id"]), {}))
+            asyncio.run(_run_session(protocol_in, protocol_out, entrypoint))
+            return 0
     except (HostProtocolError, HostEntrypointError):
         with contextlib.suppress(Exception):
             write_frame(

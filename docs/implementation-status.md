@@ -1277,6 +1277,61 @@ D7 is integrated deterministic acceptance for Stage D and its closeout, not a fe
 
 **Stage D proves capable tool-using agents.** It does not yet provide scheduling, background triggers, persistent conversation memory, installable agent packages, or interactive approvals and isolation — those remain Stages E, F, G and H. NervOS still makes **no exactly-once claim** for remote effects: it prevents known unsafe replay after dispatch and records ambiguity when a remote outcome cannot be proven.
 
+## Generic Process Agent Bridge (ADR 0041) — IMPLEMENTED
+
+**Status: ACCEPTED and IMPLEMENTED** per ADR 0041 Owner decisions.
+
+The Generic Process Agent Bridge allows any executable (not just `nervos-sdk` Python entrypoints) to run as a sandboxed NervOS agent. The agent reaches models and tools **only through NervOS** via a loopback HTTP shim in the package host that translates OpenAI-compatible `/v1/chat/completions` and MCP `/mcp` requests into the existing wire protocol frames (`model_request`/`tool_request`) over stdio.
+
+### Key Implementation Details
+
+**Manifest (M1)**: Added optional `runtime.kind` with values `python` (default, existing behavior unchanged) and `process`. For `process` kind, `runtime.command` is required: a non-empty list of strings (max 32 items, each max 512 chars), validated for no absolute paths, no `..` traversal, no shell strings. `runtime.entrypoint` and `runtime.python` remain required only for `python` kind.
+- Files: `packages/nervos-core/src/nervos_core/application/package_manifest.py`, `packages/nervos-core/src/nervos_core/domain/packages.py`
+
+**Loopback Shim (M2)**: New module `packages/nervos-package-host/src/nervos_package_host/bridge_shim.py` (standard library only). Binds `127.0.0.1` on port 0. Requires `Authorization: Bearer <per-run-random-token>` header; rejects others with 401. Rejects requests whose `Host` header is not `127.0.0.1:<port>`. Caps request body at 1 MiB, per-request timeout, and total requests per run.
+- `POST /v1/chat/completions`: Accepts messages with string content (or list of text parts, concatenated). Returns 400 if `stream=true`, non-text parts present, or `tools`/`functions` present. Translates to `model_request` wire frame, waits for `model_response`, returns OpenAI-shaped completion.
+- `POST /mcp`: Streamable HTTP, JSON-RPC 2.0, non-streaming JSON responses. Supports `initialize`, `notifications/initialized` (202), `ping`, `tools/list`, `tools/call`. `tools/call` sends `tool_request` wire frame, maps `tool_response` to MCP result; denied/failed tool returns `isError=true`.
+- **Linux-only test** added: `packages/nervos-package-host/tests/test_linux_bubblewrap_loopback.py` — asserts direct outbound network call fails inside bubblewrap; skipped on non-Linux with reason "requires bubblewrap; loopback in namespace unverified".
+
+**Host Mode (M3)**: When `runtime.kind` is `process`, package host starts shim, then spawns command as child with scrubbed environment (same allowlist as `package_host_environment()` plus `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `NERVOS_MCP_URL`). Sends run input as JSON on child's stdin, closes stdin. Exit code 0 → stdout (UTF-8, capped) is final output; non-zero → `run_error` with truncated stderr. Honors `cancel` frame by killing child tree. Shuts down shim on every exit path.
+- File: `packages/nervos-package-host/src/nervos_package_host/__main__.py` (`_run_process_agent`)
+
+**Worker (M4)**: Minimal change to accept `process` packages through same `PackageExecutionAdapter` seam: same containment, mediators, audit, limits. Reads `runtime.kind` and `runtime.command` from manifest, passes to `_spawn_host` and `initialize` frame.
+- File: `apps/worker/src/nervos_worker/package_execution.py`
+
+**Tests (M5)**:
+- Shim unit tests: `packages/nervos-package-host/tests/test_bridge_shim.py` (auth, Host check, size caps, error mappings, MCP methods, denied tool, wire protocol roundtrips)
+- E2E test: `packages/nervos-package-host/tests/test_process_agent_e2e.py` (fake foreign agent script using only stdlib, validates wire protocol frames)
+- Real-socket E2E test: `apps/worker/tests/integration/test_real_e2e_shim_child.py` (real ShimServer on 127.0.0.1 with a fake Worker wire channel and a real stdlib-only child process; granted tool returns TOOL_OK, ungranted tool denied with `isError=true`, request without Bearer key rejected with 401; exercises the shim, not the full Worker stack)
+- Linux-only test: `packages/nervos-package-host/tests/test_linux_bubblewrap_loopback.py` (skipped on Windows)
+
+**Owner Decisions** (recorded in ADR 0041):
+1. Windows behavior unchanged: package execution stays refused unless existing `NERVOS_ALLOW_WINDOWS_SANDBOX` flag allows it; no containment weakening.
+2. Streaming deferred.
+3. Images/multimodal deferred.
+4. Per-run random API key replaces fixed "nervos-proxy" placeholder.
+5. No live Linux sandbox verification; loopback assumption stays `[unverified]`.
+
+**Known Limitations**:
+- `tools/list` returns empty list (granted-tool information not yet available to host; returns `[]` with clear documentation)
+- Function-calling pass-through is NOT implemented (shim returns 400 if `tools`/`functions` present in chat completions request)
+- Loopback inside bubblewrap namespace is `[unverified]` — Linux-only test skipped
+
+**Files Changed**:
+- `packages/nervos-core/src/nervos_core/application/package_manifest.py`
+- `packages/nervos-core/src/nervos_core/domain/packages.py`
+- `packages/nervos-package-host/src/nervos_package_host/bridge_shim.py` (new)
+- `packages/nervos-package-host/src/nervos_package_host/__main__.py`
+- `apps/worker/tests/integration/test_real_e2e_shim_child.py` (new)
+- `packages/nervos-package-host/src/nervos_package_host/wire.py`
+- `packages/nervos-package-host/src/nervos_package_host/__init__.py`
+- `apps/worker/src/nervos_worker/package_execution.py`
+- `packages/nervos-package-host/tests/test_bridge_shim.py` (new)
+- `packages/nervos-package-host/tests/test_process_agent_e2e.py` (new)
+- `packages/nervos-package-host/tests/test_linux_bubblewrap_loopback.py` (new)
+- `docs/adr/0041-generic-process-agent-bridge.md` (Status → ACCEPTED, Owner decisions added)
+- `docs/generic-agent-bridge/plan.md` (Status → IMPLEMENTED, milestones marked complete)
+
 ## Maintenance rule
 
 Update this file after every accepted milestone. Do not check an item merely because code was generated; verify its acceptance criteria first.
