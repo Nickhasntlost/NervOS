@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import stat
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -218,6 +219,7 @@ class PackageExecutionAdapter:
             )
             if not package_root.is_dir():
                 raise ModelProviderError(INTERNAL_EXECUTION_ERROR)
+            prepare_process_command_target(package_root, runtime_command)
 
         # The initialize frame's tool list for a process-kind run: exactly the run's
         # granted tools as of its durable cutoff. This only informs the agent's
@@ -753,6 +755,27 @@ def _parse_offered_tools(raw: object, *, declared_tools: frozenset[str]) -> tupl
             )
         )
     return tuple(schemas)
+
+
+def prepare_process_command_target(package_root: Path, command: Sequence[str]) -> None:
+    """ADR 0043 item 1: make ``runtime.command[0]`` runnable inside the bundle.
+
+    The target must be a file inside the materialized bundle; anything else is
+    refused on every platform. The executable bit itself is set on POSIX only —
+    Windows has no such bit — and nothing else about the file, the archive, the
+    signatures, or the integrity digests changes.
+    """
+    if not command:
+        raise ModelProviderError(INTERNAL_EXECUTION_ERROR)
+    bundle_root = package_root.resolve(strict=False)
+    target = (package_root / command[0]).resolve(strict=False)
+    if target != bundle_root and bundle_root not in target.parents:
+        raise ModelProviderError(INTERNAL_EXECUTION_ERROR)
+    if not target.is_file():
+        raise ModelProviderError(INTERNAL_EXECUTION_ERROR)
+    if os.name == "posix":
+        mode = target.stat().st_mode
+        os.chmod(target, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def granted_tools_payload(

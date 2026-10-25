@@ -1388,6 +1388,35 @@ tool choice would need a core change.
 - Dependency bundling investigation (no code change):
   `docs/adr/0043-bridge-agent-dependency-bundling.md` (Status: PROPOSED).
 
+**Verified with real SDKs** (`scripts/bridge_sdk_smoke.py`: real ShimServer + fake wire
+Worker; the SDKs run in a throwaway venv outside the repo, default client settings, no
+custom transport, loopback only — no live provider call):
+
+| SDK | Version | Cases (all passed unless noted) |
+|---|---|---|
+| `openai` | 3.37.0 | chat_plain, chat_stream, chat_tool, responses_plain, responses_stream, responses_tool, models_list — 7/7 |
+| `anthropic` | 2.3.0 | messages_plain, messages_stream, messages_tool, models_list — 4/4 |
+| `google-genai` | 2.33.0 | generate_plain, generate_stream, generate_tool — 3/3 |
+
+No shim compatibility fixes were required: the first valid run passed 14/14. The only
+defect found was in the smoke harness itself (a blocking subprocess call that froze the
+event loop); it was fixed before the first valid run and changed no shipped code.
+
+**Bundling (ADR 0043 items 1 and 2 — ACCEPTED, implemented)**:
+
+- `prepare_process_command_target` (`apps/worker/src/nervos_worker/package_execution.py`):
+  after materialization, the process-kind `runtime.command[0]` must be a file inside the
+  bundle (refused otherwise on every platform) and, on POSIX only, gets the executable
+  bit. Archive format, signing, integrity digests, and other files' modes are untouched.
+  Tests: `apps/worker/tests/unit/test_process_command_target.py` (POSIX chmod test skips
+  on Windows with that reason; the containment refusals run everywhere).
+- `process_agent_environment` exports `NERVOS_PACKAGE_PYTHON` = the package environment
+  interpreter (the host's `sys.executable` inside the sandbox), so Python foreign agents
+  run on the same offline site-packages as python-kind packages.
+  Test: `packages/nervos-package-host/tests/test_process_agent_environment.py`.
+- ADR 0043 Status is now ACCEPTED for items 1 and 2; the Node runtime (item 3) stays
+  deferred.
+
 **Files Changed**:
 - `packages/nervos-core/src/nervos_core/application/package_manifest.py`
 - `packages/nervos-core/src/nervos_core/domain/packages.py`

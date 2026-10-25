@@ -1,6 +1,9 @@
-# ADR 0044: the child environment points every vendor SDK at the loopback shim.
+# ADR 0044 + ADR 0043 item 2: the child environment points every vendor SDK at the
+# loopback shim and names the package environment's interpreter.
 
 from __future__ import annotations
+
+import sys
 
 from nervos_package_host.__main__ import process_agent_environment
 
@@ -18,4 +21,7 @@ def test_process_agent_environment_points_every_sdk_at_the_shim() -> None:
     assert env["GEMINI_API_KEY"] == "run-key"
     assert env["GOOGLE_API_KEY"] == "run-key"
     assert env["NERVOS_MCP_URL"] == "http://127.0.0.1:45123/mcp"
-    assert len(env) == 8
+    # ADR 0043 item 2: the package environment's interpreter, so a Python foreign
+    # agent uses the same offline site-packages as python-kind packages.
+    assert env["NERVOS_PACKAGE_PYTHON"] == sys.executable
+    assert len(env) == 9

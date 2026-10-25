@@ -13,9 +13,16 @@ the initialize frame listing the run's real granted tools. See
 - Forced `tool_choice` (required/named/any/tool) and multi-turn tool history: both need
   a core `ModelRequest` change (currently refused; ADR 0042 records the smallest
   additive alternative)
-- Agent dependency bundling beyond Python wheels (exec bit, interpreter variables,
-  Node runtime) — investigated in ADR 0043 (PROPOSED), not implemented
+- Node runtime support (ADR 0043 item 3, deferred)
 - Linux loopback verification inside bubblewrap (`[unverified]` as in ADR 0041)
+- End-to-end execution through the real Worker on Linux (the real-socket suites and the
+  SDK smoke harness drive the shim with a fake wire Worker)
+
+**ADR 0043 update (bundling, items 1+2)**: `runtime.command[0]` gets the executable bit
+inside the bundle (POSIX only, containment-refused otherwise) and the child environment
+exports `NERVOS_PACKAGE_PYTHON` — both implemented and tested. The shim has also been
+verified against the real `openai`, `anthropic`, and `google-genai` SDKs via
+`scripts/bridge_sdk_smoke.py` (14/14 cases; see implementation-status.md).
 
 **ADR 0044 update (vendor API shapes)**: the shim now also serves Anthropic Messages
 (`/v1/messages`), OpenAI Responses (`/v1/responses`), and Gemini

@@ -1,7 +1,17 @@
 # ADR 0043 — Bridge Agent Dependency Bundling
 
-**Status: PROPOSED** — An investigation record with a recommendation. Nothing here is
-accepted or implemented; no code changed for this ADR.
+**Status: ACCEPTED for items 1 and 2 (implemented); item 3 (Node runtime) explicitly
+DEFERDED.** The investigation below stands as written; the accepted items are the two
+smallest changes it identified, in exactly the decided forms:
+
+1. After a process-kind package is materialized, on POSIX only, the executable bit is
+   set on the single file named by `runtime.command[0]`. The target must be inside the
+   bundle; anything else is refused on every platform. The archive format, signing,
+   integrity digests, and every other file's mode are untouched.
+2. `process_agent_environment` exports `NERVOS_PACKAGE_PYTHON`, set to the interpreter
+   of the package environment (the host's own `sys.executable` inside the sandbox).
+
+Item 3 — a Node runtime artifact — stays out of scope.
 
 ## Question
 
@@ -64,7 +74,7 @@ the smallest change that would support each shape?
   POSIX executable bit is **not** preserved from the archive; a `runtime.command` whose
   first item is such a file would fail with `EACCES` on Linux.
 
-## Recommendation (smallest additive change)
+## Recommendation (smallest additive change) — items 1 and 2 now implemented
 
 1. **Exec bit**: at materialization, mark process-kind command targets (or every
    payload member under a `bin/` prefix) executable. One flag on the archive entry
@@ -81,6 +91,11 @@ the smallest change that would support each shape?
    environment — plus `NERVOS_PACKAGE_NODE` in the child environment. `node_modules`
    needs no support of its own: assets already carry it read-only.
 
-Items 1 and 2 are additive, manifest-compatible, and need no Worker/core/wire change.
-Item 3 adds a new runtime artifact kind and is the only piece that touches
-installation machinery. None of this is implemented by ADR 0044.
+Items 1 and 2 are additive, manifest-compatible, and need no Worker/core/wire change;
+they are implemented as `prepare_process_command_target` (exec bit + containment
+refusal, `apps/worker/src/nervos_worker/package_execution.py`, tested in
+`apps/worker/tests/unit/test_process_command_target.py`) and the
+`NERVOS_PACKAGE_PYTHON` export (`packages/nervos-package-host/src/nervos_package_host/__main__.py`,
+`process_agent_environment`, tested in
+`packages/nervos-package-host/tests/test_process_agent_environment.py`). Item 3 adds
+a new runtime artifact kind, touches installation machinery, and remains deferred.

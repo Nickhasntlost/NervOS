@@ -186,7 +186,9 @@ def process_agent_environment(origin: str, token: str) -> dict[str, str]:
 
     ``origin`` is the shim's base origin (``http://127.0.0.1:<port>``); each SDK's
     base-url convention gets the suffix it appends itself, and every key variable
-    carries the same per-run token. ADR 0044.
+    carries the same per-run token. ADR 0044. ``NERVOS_PACKAGE_PYTHON`` names the
+    read-only package environment's interpreter (ADR 0043 item 2), so a Python
+    foreign agent runs on the same offline site-packages as python-kind packages.
     """
     return {
         "OPENAI_BASE_URL": f"{origin}/v1",
@@ -197,6 +199,7 @@ def process_agent_environment(origin: str, token: str) -> dict[str, str]:
         "GEMINI_API_KEY": token,
         "GOOGLE_API_KEY": token,
         "NERVOS_MCP_URL": f"{origin}/mcp",
+        "NERVOS_PACKAGE_PYTHON": sys.executable,
     }
 
 
