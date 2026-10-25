@@ -1313,9 +1313,45 @@ The Generic Process Agent Bridge allows any executable (not just `nervos-sdk` Py
 5. No live Linux sandbox verification; loopback assumption stays `[unverified]`.
 
 **Known Limitations**:
-- `tools/list` returns empty list (granted-tool information not yet available to host; returns `[]` with clear documentation)
-- Function-calling pass-through is NOT implemented (shim returns 400 if `tools`/`functions` present in chat completions request)
 - Loopback inside bubblewrap namespace is `[unverified]` — Linux-only test skipped
+- Anthropic/Responses/Gemini-compatible endpoints are not implemented (ADR 0042 Part 2)
+- A conversation whose tool exchange precedes a later user message is refused
+  (`model_request_rejected`): the core `ModelRequest` cannot represent it and ADR 0042
+  does not change the core
+- Streaming is replay of one full `model_response` as SSE, not incremental generation
+
+**Bridge Model Tools and Streaming (ADR 0042) — IMPLEMENTED**:
+
+-**SDK (M1)**: `nervos_sdk.types` adds optional, defaulted tool fields — `ToolDefinition`
+(name, description, JSON-schema parameters) on `ModelRequest`; `tool_calls`
+(`ToolCall`: id, name, JSON-text-or-mapping arguments) and `tool_call_id` on
+`ModelMessage`; `tool_calls` on `ModelResult` with the `STOP_REASON_TOOL_USE` convention.
+Frozen-dataclass and JSON-freezing style throughout; existing constructions unchanged.
+-**Wire (M2)**: `model_request` frames may carry `tools` and per-message
+`tool_calls`/`tool_call_id`; `model_response` frames may carry `tool_calls`. Frames
+without the new fields stay valid; advertised via the existing capability list as
+`model-tools-v1`.
+-**Worker (M3)**: `complete_model` maps the wire conversation onto the core
+`ModelRequest` (systems → `system_instruction`, plain prefix → `history`, current user →
+`user_text`, trailing assistant/tool exchange → `turns`), validates and filters offered
+tools to the run's declared tools (≤64 tools; text + tool traffic + schemas ≤ 64 KiB),
+and returns the core `tool_calls` in the response frame. The process-kind initialize
+frame now lists exactly the run's granted tools via `granted_tools_payload`
+(`list_grants_at_or_before_cutoff` × `gather_descriptors`), closing ADR 0041 M3's gap.
+-**Shim (M4)**: `/v1/chat/completions` accepts `tools`, `tool_choice` (auto/none;
+`required`/named → 400), assistant `tool_calls`, `role: tool` messages, and
+`stream: true` (full-result-then-SSE replay with tool_call deltas, finish chunk,
+optional `stream_options.include_usage` usage chunk, `[DONE]`). Non-text content parts
+and non-function tools get 400; all existing loopback protections apply unchanged.
+-**Tests (M5)**: real-socket suite
+`apps/worker/tests/integration/test_real_e2e_shim_tools_stream.py` (tool loop, streamed
+text + usage, streamed tool call, 400/413 rejections that never reach the wire);
+`apps/worker/tests/unit/test_model_tool_mediation.py`; `apps/worker/tests/unit/test_granted_tools_payload.py`;
+`packages/nervos-sdk/tests/test_public_contracts.py`; `packages/nervos-package-host/tests/test_wire_model_tools.py`.
+- Files: `packages/nervos-sdk/src/nervos_sdk/types.py`, `packages/nervos-sdk/src/nervos_sdk/__init__.py`,
+`packages/nervos-package-host/src/nervos_package_host/wire.py`, `bridge_shim.py`, `__main__.py`,
+`apps/worker/src/nervos_worker/package_execution.py`, and the test files above.
+- ADR: `docs/adr/0042-bridge-model-tools-and-streaming.md` (Status: ACCEPTED).
 
 **Files Changed**:
 - `packages/nervos-core/src/nervos_core/application/package_manifest.py`

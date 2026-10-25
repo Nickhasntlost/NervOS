@@ -53,6 +53,52 @@ class ModelMessage:
 
     role: Literal["system", "user", "assistant", "tool"]
     content: str
+    # Assistant history may carry the tool calls it asked for; a tool message is
+    # addressed back to one of them. Both default to "absent", so an ordinary
+    # text-only message is exactly what it always was.
+    tool_calls: Sequence[ToolCall] = ()
+    tool_call_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDefinition:
+    """One tool a model request offers, with its JSON-schema parameters.
+
+    Additive: requests without tools are byte-for-byte what they always were.
+    """
+
+    name: str
+    description: str
+    parameters: Mapping[str, JSONValue] = field(default_factory=_json_mapping)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameters", _freeze_mapping(self.parameters))
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCall:
+    """One tool call: carried by assistant history and by model results.
+
+    ``arguments`` is the provider's JSON **text** on results, and either that text or
+    an already-decoded mapping on assistant history; a mapping is frozen like every
+    other SDK JSON value.
+    """
+
+    id: str
+    name: str
+    arguments: str | Mapping[str, JSONValue] = ""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.arguments, Mapping):
+            object.__setattr__(self, "arguments", _freeze_mapping(self.arguments))
+
+
+# The stop reason a result carries when the model asked for tools instead of text;
+# the same value the core normalization uses, so the wire never translates it.
+STOP_REASON_TOOL_USE = "tool_use"
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,10 +110,12 @@ class ModelRequest:
     temperature: float | None = None
     max_output_tokens: int | None = None
     metadata: Mapping[str, JSONValue] = field(default_factory=_json_mapping)
+    tools: Sequence[ToolDefinition] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "messages", tuple(self.messages))
         object.__setattr__(self, "metadata", _freeze_mapping(self.metadata))
+        object.__setattr__(self, "tools", tuple(self.tools))
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,9 +125,11 @@ class ModelResult:
     output_text: str
     stop_reason: str | None = None
     usage: Mapping[str, int] = field(default_factory=_int_mapping)
+    tool_calls: Sequence[ToolCall] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
+        object.__setattr__(self, "tool_calls", tuple(self.tool_calls))
 
 
 @dataclass(frozen=True, slots=True)

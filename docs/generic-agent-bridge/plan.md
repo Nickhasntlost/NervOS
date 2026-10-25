@@ -2,6 +2,20 @@
 
 **Status: PARTIAL** — Core milestones completed; missing items listed below.
 
+**ADR 0042 update (function calling + streaming)**: the shim's
+`/v1/chat/completions` now supports OpenAI `tools`, `tool_choice` (auto/none),
+assistant `tool_calls`, `role: tool` messages, and `stream: true` replayed as SSE,
+with the Worker mapping onto the core `ModelRequest`/`ModelResponse` tool fields and
+the initialize frame listing the run's real granted tools. See
+`docs/adr/0042-bridge-model-tools-and-streaming.md`.
+
+**What remains**:
+- Anthropic-compatible, OpenAI Responses, and Gemini endpoints (ADR 0042 Part 2)
+- Bundling examples/package templates for foreign SDKs
+- Linux loopback verification inside bubblewrap (`[unverified]` as in ADR 0041)
+- Core representability for a tool exchange followed by a later user message
+  (currently refused with `model_request_rejected`; needs a core ADR)
+
 ---
 
 ## Problem Statement

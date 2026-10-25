@@ -5,6 +5,7 @@ from nervos_sdk.ports import ModelPort, ToolPort
 from nervos_sdk.types import (
     CHECKPOINT_MAX_BYTES,
     SDK_API_VERSION,
+    STOP_REASON_TOOL_USE,
     SUMMARY_MAX_CHARS,
     WORKFLOW_SNAPSHOT_STATE_VERSION,
     AgentContext,
@@ -17,6 +18,8 @@ from nervos_sdk.types import (
     ModelRequest,
     ModelResult,
     SelectedMemory,
+    ToolCall,
+    ToolDefinition,
     ToolRequest,
     ToolResult,
     WorkflowDecisionProposal,
@@ -28,6 +31,7 @@ from nervos_sdk.types import (
 __all__ = [
     "CHECKPOINT_MAX_BYTES",
     "SDK_API_VERSION",
+    "STOP_REASON_TOOL_USE",
     "SUMMARY_MAX_CHARS",
     "WORKFLOW_SNAPSHOT_STATE_VERSION",
     "AgentContext",
@@ -42,6 +46,8 @@ __all__ = [
     "ModelRequest",
     "ModelResult",
     "SelectedMemory",
+    "ToolCall",
+    "ToolDefinition",
     "ToolPort",
     "ToolRequest",
     "ToolResult",

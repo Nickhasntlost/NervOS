@@ -21,6 +21,7 @@ from nervos_sdk import (
     ModelRequest,
     ModelResult,
     SelectedMemory,
+    ToolCall,
     ToolRequest,
     ToolResult,
     WorkflowDecisionProposal,
@@ -280,23 +281,67 @@ async def _run_session(protocol_in: BinaryIO, protocol_out: BinaryIO, entrypoint
         return _mapping(response["payload"], "port response")
 
     async def model_complete(request: ModelRequest) -> ModelResult:
-        response = rpc(
-            "model_request",
-            {
-                "messages": [
-                    {"role": item.role, "content": item.content} for item in request.messages
-                ],
-                "model": request.model,
-                "temperature": request.temperature,
-                "max_output_tokens": request.max_output_tokens,
-                "metadata": dict(request.metadata),
-            },
-        )
+        messages: list[dict[str, object]] = []
+        for item in request.messages:
+            message: dict[str, object] = {"role": item.role, "content": item.content}
+            if item.tool_calls:
+                message["tool_calls"] = [
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "arguments": (
+                            call.arguments
+                            if isinstance(call.arguments, str)
+                            else json.dumps(
+                                dict(call.arguments),
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                        ),
+                    }
+                    for call in item.tool_calls
+                ]
+            if item.tool_call_id is not None:
+                message["tool_call_id"] = item.tool_call_id
+            messages.append(message)
+        payload: dict[str, object] = {
+            "messages": messages,
+            "model": request.model,
+            "temperature": request.temperature,
+            "max_output_tokens": request.max_output_tokens,
+            "metadata": dict(request.metadata),
+        }
+        if request.tools:
+            payload["tools"] = [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": dict(tool.parameters),
+                }
+                for tool in request.tools
+            ]
+        response = rpc("model_request", payload)
         stop_reason = response.get("stop_reason")
+        tool_calls: list[ToolCall] = []
+        raw_tool_calls = response.get("tool_calls")
+        if isinstance(raw_tool_calls, list):
+            for raw in cast("list[object]", raw_tool_calls):
+                if isinstance(raw, dict):
+                    entry = cast("dict[str, object]", raw)
+                    call_id = entry.get("id")
+                    name = entry.get("name")
+                    arguments = entry.get("arguments")
+                    if (
+                        isinstance(call_id, str)
+                        and isinstance(name, str)
+                        and isinstance(arguments, str)
+                    ):
+                        tool_calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
         return ModelResult(
             output_text=_string(response.get("output_text"), "model response output_text"),
             stop_reason=stop_reason if isinstance(stop_reason, str) else None,
             usage=cast("dict[str, int]", response.get("usage", {})),
+            tool_calls=tuple(tool_calls),
         )
 
     async def tool_invoke(request: ToolRequest) -> ToolResult:

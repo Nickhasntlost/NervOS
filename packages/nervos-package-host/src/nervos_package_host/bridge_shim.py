@@ -42,6 +42,17 @@ class ShimError(Exception):
         self.status = status
 
 
+def _finish_reason(stop_reason: object) -> str:
+    """Map the wire stop reason onto the OpenAI chat finish_reason vocabulary."""
+    if stop_reason == "tool_use":
+        return "tool_calls"
+    if stop_reason == "length":
+        return "length"
+    if stop_reason == "error":
+        return "error"
+    return "stop"
+
+
 @dataclass(slots=True)
 class ShimConfig:
     token: str
@@ -192,45 +203,10 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
             raise ShimError("request must be an object", HTTPStatus.BAD_REQUEST)
         request = cast("dict[str, object]", parsed)
 
-        messages = request.get("messages")
-        if not isinstance(messages, list) or not messages:
-            raise ShimError("messages must be a non-empty array", HTTPStatus.BAD_REQUEST)
-
-        normalized_messages: list[dict[str, str]] = []
-        for msg in cast("list[object]", messages):
-            if not isinstance(msg, dict):
-                raise ShimError("each message must be an object", HTTPStatus.BAD_REQUEST)
-            item = cast("dict[str, object]", msg)
-            role = item.get("role")
-            content = item.get("content")
-            if role not in ("system", "user", "assistant"):
-                error = "message role must be system, user, or assistant"
-                raise ShimError(error, HTTPStatus.BAD_REQUEST)
-            if isinstance(content, str):
-                normalized_messages.append({"role": role, "content": content})
-            elif isinstance(content, list):
-                text_parts: list[str] = []
-                for part in cast("list[object]", content):
-                    part_item = cast("dict[str, object]", part) if isinstance(part, dict) else None
-                    if part_item is None or part_item.get("type") != "text":
-                        error = "only text content parts are supported"
-                        raise ShimError(error, HTTPStatus.BAD_REQUEST)
-                    text = part_item.get("text")
-                    if isinstance(text, str):
-                        text_parts.append(text)
-                    else:
-                        error = "only text content parts are supported"
-                        raise ShimError(error, HTTPStatus.BAD_REQUEST)
-                normalized_messages.append({"role": role, "content": "".join(text_parts)})
-            else:
-                error = "message content must be string or array of text parts"
-                raise ShimError(error, HTTPStatus.BAD_REQUEST)
-
-        if request.get("stream") is True:
-            raise ShimError("streaming is not supported", HTTPStatus.BAD_REQUEST)
-        if request.get("tools") is not None or request.get("functions") is not None:
-            error = "tools/functions not supported; use MCP endpoint for tools"
-            raise ShimError(error, HTTPStatus.BAD_REQUEST)
+        normalized_messages = self._parse_chat_messages(request)
+        offered_tools = self._parse_chat_tools(request)
+        stream = request.get("stream") is True
+        include_usage = self._stream_include_usage(request)
 
         model = request.get("model")
         if not isinstance(model, str) or not model:
@@ -244,6 +220,16 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
         if max_tokens is not None and not isinstance(max_tokens, int):
             raise ShimError("max_tokens must be an integer", HTTPStatus.BAD_REQUEST)
 
+        payload: dict[str, object] = {
+            "messages": normalized_messages,
+            "model": model,
+            "temperature": temperature,
+            "max_output_tokens": max_tokens,
+            "metadata": {},
+        }
+        if offered_tools:
+            payload["tools"] = offered_tools
+
         request_id = state.next_id()
         future = self._new_future(state)
         state.pending[request_id] = future
@@ -252,49 +238,315 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
             "protocol_version": HOST_PROTOCOL_VERSION,
             "type": "model_request",
             "request_id": request_id,
-            "payload": {
-                "messages": normalized_messages,
-                "model": model,
-                "temperature": temperature,
-                "max_output_tokens": max_tokens,
-                "metadata": {},
-            },
+            "payload": payload,
         }
 
         wire_out = state.wire_out
         assert wire_out is not None
         write_frame(wire_out, frame)
 
+        # ADR 0042 owner decision: no real token streaming. The full result is
+        # awaited first, then replayed as valid SSE for unmodified SDK clients.
         response = self._wait_for_response(state, request_id, "model")
 
-        stop_reason = response.get("stop_reason")
-        finish_reason = "stop"
-        if stop_reason == "length":
-            finish_reason = "length"
-        elif stop_reason == "error":
-            finish_reason = "error"
-
+        tool_calls = self._response_tool_calls(response)
+        output_text = response.get("output_text", "")
+        text = output_text if isinstance(output_text, str) else ""
+        finish_reason = _finish_reason(response.get("stop_reason"))
         usage_raw = response.get("usage", {})
         usage = cast("dict[str, object]", usage_raw) if isinstance(usage_raw, dict) else {}
+        usage_payload: dict[str, object] = {
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "total_tokens": usage.get("total_tokens", 0),
+        }
+        completion_id = f"chatcmpl-{secrets.token_hex(12)}"
+        created = int(time.time())
+        if stream:
+            self._send_chat_stream(
+                completion_id,
+                created,
+                model,
+                text,
+                tool_calls,
+                finish_reason,
+                usage_payload,
+                include_usage,
+            )
+            return
+        message: dict[str, object] = {"role": "assistant", "content": output_text}
+        if tool_calls:
+            message["tool_calls"] = [
+                {
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {"name": call["name"], "arguments": call["arguments"]},
+                }
+                for call in tool_calls
+            ]
         completion: dict[str, object] = {
-            "id": f"chatcmpl-{secrets.token_hex(12)}",
+            "id": completion_id,
             "object": "chat.completion",
-            "created": int(time.time()),
+            "created": created,
             "model": model,
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": response.get("output_text", "")},
+                    "message": message,
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
+            "usage": usage_payload,
         }
         self._send_json(HTTPStatus.OK, completion)
+
+    def _parse_chat_messages(self, request: dict[str, object]) -> list[dict[str, object]]:
+        messages = request.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ShimError("messages must be a non-empty array", HTTPStatus.BAD_REQUEST)
+        normalized: list[dict[str, object]] = []
+        for msg in cast("list[object]", messages):
+            if not isinstance(msg, dict):
+                raise ShimError("each message must be an object", HTTPStatus.BAD_REQUEST)
+            item = cast("dict[str, object]", msg)
+            role = item.get("role")
+            if role not in ("system", "user", "assistant", "tool"):
+                error = "message role must be system, user, assistant, or tool"
+                raise ShimError(error, HTTPStatus.BAD_REQUEST)
+            content = self._message_text(item.get("content"))
+            entry: dict[str, object] = {"role": role, "content": content}
+            if role == "assistant":
+                wire_calls = self._parse_openai_tool_calls(item.get("tool_calls"))
+                if wire_calls:
+                    entry["tool_calls"] = wire_calls
+            elif role == "tool":
+                tool_call_id = item.get("tool_call_id")
+                if not isinstance(tool_call_id, str) or not tool_call_id:
+                    error = "tool messages require a tool_call_id"
+                    raise ShimError(error, HTTPStatus.BAD_REQUEST)
+                entry["tool_call_id"] = tool_call_id
+            normalized.append(entry)
+        return normalized
+
+    def _message_text(self, content: object) -> str:
+        if content is None:
+            # OpenAI clients send null content alongside assistant tool_calls.
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for part in cast("list[object]", content):
+                part_item = cast("dict[str, object]", part) if isinstance(part, dict) else None
+                if part_item is None or part_item.get("type") != "text":
+                    error = "only text content parts are supported"
+                    raise ShimError(error, HTTPStatus.BAD_REQUEST)
+                text = part_item.get("text")
+                if not isinstance(text, str):
+                    error = "only text content parts are supported"
+                    raise ShimError(error, HTTPStatus.BAD_REQUEST)
+                text_parts.append(text)
+            return "".join(text_parts)
+        error = "message content must be string or array of text parts"
+        raise ShimError(error, HTTPStatus.BAD_REQUEST)
+
+    def _parse_openai_tool_calls(self, raw: object) -> list[dict[str, object]]:
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ShimError("tool_calls must be an array", HTTPStatus.BAD_REQUEST)
+        calls: list[dict[str, object]] = []
+        for entry in cast("list[object]", raw):
+            if not isinstance(entry, dict):
+                raise ShimError("each tool_call must be an object", HTTPStatus.BAD_REQUEST)
+            item = cast("dict[str, object]", entry)
+            if item.get("type") not in (None, "function"):
+                error = "only function tool calls are supported"
+                raise ShimError(error, HTTPStatus.BAD_REQUEST)
+            function = item.get("function")
+            function_item = (
+                cast("dict[str, object]", function) if isinstance(function, dict) else item
+            )
+            call_id = item.get("id")
+            name = function_item.get("name")
+            arguments = function_item.get("arguments")
+            if not isinstance(call_id, str) or not call_id:
+                raise ShimError("tool_call id is required", HTTPStatus.BAD_REQUEST)
+            if not isinstance(name, str) or not name:
+                raise ShimError("tool_call name is required", HTTPStatus.BAD_REQUEST)
+            if isinstance(arguments, Mapping):
+                arguments_text = json.dumps(
+                    dict(cast("Mapping[str, object]", arguments)),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            elif isinstance(arguments, str):
+                arguments_text = arguments
+            elif arguments is None:
+                arguments_text = "{}"
+            else:
+                raise ShimError("tool_call arguments must be JSON text", HTTPStatus.BAD_REQUEST)
+            calls.append({"id": call_id, "name": name, "arguments": arguments_text})
+        return calls
+
+    def _parse_chat_tools(self, request: dict[str, object]) -> list[dict[str, object]]:
+        if request.get("functions") is not None:
+            raise ShimError("functions are not supported; send tools", HTTPStatus.BAD_REQUEST)
+        raw_tools = request.get("tools")
+        if raw_tools is None:
+            return []
+        if not isinstance(raw_tools, list):
+            raise ShimError("tools must be an array", HTTPStatus.BAD_REQUEST)
+        tools: list[dict[str, object]] = []
+        for entry in cast("list[object]", raw_tools):
+            if not isinstance(entry, dict):
+                raise ShimError("each tool must be an object", HTTPStatus.BAD_REQUEST)
+            item = cast("dict[str, object]", entry)
+            if item.get("type") not in (None, "function"):
+                error = "only function tools are supported"
+                raise ShimError(error, HTTPStatus.BAD_REQUEST)
+            function = item.get("function")
+            function_item = (
+                cast("dict[str, object]", function) if isinstance(function, dict) else item
+            )
+            name = function_item.get("name")
+            description = function_item.get("description")
+            parameters = function_item.get("parameters")
+            if not isinstance(name, str) or not name:
+                raise ShimError("tool name is required", HTTPStatus.BAD_REQUEST)
+            if description is not None and not isinstance(description, str):
+                error = "tool description must be a string"
+                raise ShimError(error, HTTPStatus.BAD_REQUEST)
+            if parameters is not None and not isinstance(parameters, dict):
+                error = "tool parameters must be a JSON schema object"
+                raise ShimError(error, HTTPStatus.BAD_REQUEST)
+            tool: dict[str, object] = {
+                "name": name,
+                "description": description if isinstance(description, str) else "",
+            }
+            if isinstance(parameters, dict):
+                tool["parameters"] = parameters
+            tools.append(tool)
+        return self._apply_tool_choice(request.get("tool_choice"), tools)
+
+    def _apply_tool_choice(
+        self, raw: object, tools: list[dict[str, object]]
+    ) -> list[dict[str, object]]:
+        if raw is None or raw == "auto":
+            return tools
+        if raw == "none":
+            # "none" is representable: the offered tools simply never reach the model.
+            return []
+        if isinstance(raw, str):
+            raise ShimError(f"tool_choice '{raw}' is not supported", HTTPStatus.BAD_REQUEST)
+        if isinstance(raw, dict):
+            raise ShimError("named tool_choice is not supported", HTTPStatus.BAD_REQUEST)
+        raise ShimError("tool_choice must be a string", HTTPStatus.BAD_REQUEST)
+
+    def _stream_include_usage(self, request: dict[str, object]) -> bool:
+        options = request.get("stream_options")
+        if options is None:
+            return False
+        if not isinstance(options, dict):
+            raise ShimError("stream_options must be an object", HTTPStatus.BAD_REQUEST)
+        return cast("dict[str, object]", options).get("include_usage") is True
+
+    def _response_tool_calls(self, response: dict[str, object]) -> list[dict[str, object]]:
+        raw = response.get("tool_calls")
+        if not isinstance(raw, list):
+            return []
+        calls: list[dict[str, object]] = []
+        for entry in cast("list[object]", raw):
+            if not isinstance(entry, dict):
+                continue
+            item = cast("dict[str, object]", entry)
+            call_id = item.get("id")
+            name = item.get("name")
+            arguments = item.get("arguments")
+            if isinstance(call_id, str) and isinstance(name, str):
+                calls.append(
+                    {
+                        "id": call_id,
+                        "name": name,
+                        "arguments": arguments if isinstance(arguments, str) else "{}",
+                    }
+                )
+        return calls
+
+    def _send_chat_stream(
+        self,
+        completion_id: str,
+        created: int,
+        model: str,
+        text: str,
+        tool_calls: list[dict[str, object]],
+        finish_reason: str,
+        usage: dict[str, object],
+        include_usage: bool,
+    ) -> None:
+        def encode(document: dict[str, object]) -> bytes:
+            return b"data: " + json.dumps(document, separators=(",", ":")).encode("utf-8") + b"\n\n"
+
+        def chunk(delta: dict[str, object], finish: str | None) -> dict[str, object]:
+            return {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+
+        events = [encode(chunk({"role": "assistant", "content": ""}, None))]
+        if text:
+            events.append(encode(chunk({"content": text}, None)))
+        for index, call in enumerate(tool_calls):
+            call_id = cast("str", call["id"])
+            name = cast("str", call["name"])
+            arguments = cast("str", call["arguments"])
+            events.append(
+                encode(
+                    chunk(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""},
+                                }
+                            ]
+                        },
+                        None,
+                    )
+                )
+            )
+            events.append(
+                encode(
+                    chunk(
+                        {"tool_calls": [{"index": index, "function": {"arguments": arguments}}]},
+                        None,
+                    )
+                )
+            )
+        events.append(encode(chunk({}, finish_reason)))
+        if include_usage:
+            usage_document: dict[str, object] = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "usage": usage,
+            }
+            events.append(encode(usage_document))
+        events.append(b"data: [DONE]\n\n")
+        body = b"".join(events)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_mcp(self, body: bytes) -> None:
         state = self._require_state()
