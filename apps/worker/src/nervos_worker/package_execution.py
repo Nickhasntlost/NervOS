@@ -25,8 +25,11 @@ from nervos_core.application.model_completion import (
     ModelCompletion,
     ModelProviderError,
     ToolCall,
+    ToolChoice,
+    ToolChoiceKind,
     ToolResultTurn,
     ToolSchema,
+    UserTurn,
 )
 from nervos_core.application.model_completion import (
     ModelRequest as CoreModelRequest,
@@ -563,12 +566,14 @@ class PackageExecutionAdapter:
         if not user_indexes:
             raise ModelProviderError(MODEL_REQUEST_REJECTED)
         last_user = user_indexes[-1]
-        # Before the current user turn only plain text history is representable: the core
-        # request carries tool traffic after the current user text, never before it.
-        for entry in entries[:last_user]:
-            if entry.role not in ("user", "assistant") or entry.tool_calls:
-                raise ModelProviderError(MODEL_REQUEST_REJECTED)
-        tail = entries[last_user + 1 :]
+        # ADR 0045: when tool traffic precedes the last user message, the whole
+        # conversation is carried as the ordered bridge conversation instead of the
+        # history/user_text/turns layout, which cannot represent it.
+        conversation: tuple[AssistantTurn | ToolResultTurn | UserTurn, ...] = ()
+        earlier = entries[:last_user]
+        if any(entry.role == "tool" or entry.tool_calls for entry in earlier):
+            conversation = tuple(_conversation_item(entry) for entry in entries)
+        tail = () if conversation else entries[last_user + 1 :]
         emitted_call_ids: set[str] = set()
         turns: list[AssistantTurn | ToolResultTurn] = []
         for entry in tail:
@@ -594,6 +599,7 @@ class PackageExecutionAdapter:
         offered_tools: tuple[ToolSchema, ...] = ()
         if payload.get("tools") is not None:
             offered_tools = _parse_offered_tools(payload["tools"], declared_tools=declared_tools)
+        requested_choice = _parse_wire_tool_choice(payload.get("tool_choice"), offered_tools)
         tool_traffic_bytes = sum(
             len(arguments) for entry in tail for _, _, arguments in entry.tool_calls
         ) + sum(
@@ -607,9 +613,13 @@ class PackageExecutionAdapter:
             > _MODEL_PAYLOAD_MAX_BYTES
         ):
             raise ModelProviderError(MODEL_REQUEST_REJECTED)
-        history = tuple(
-            HistoricalMessage(0, index, 0, MessageRole(entry.role), entry.content)
-            for index, entry in enumerate(entries[:last_user], 1)
+        history = (
+            ()
+            if conversation
+            else tuple(
+                HistoricalMessage(0, index, 0, MessageRole(entry.role), entry.content)
+                for index, entry in enumerate(entries[:last_user], 1)
+            )
         )
         temperature = payload.get("temperature")
         if temperature is not None and (
@@ -637,6 +647,8 @@ class PackageExecutionAdapter:
                 temperature=cast("float | None", temperature),
                 tools=offered_tools,
                 turns=tuple(turns),
+                tool_choice=requested_choice,
+                conversation=conversation,
             )
         )
         usage = response.usage or ModelUsage()
@@ -776,6 +788,48 @@ def prepare_process_command_target(package_root: Path, command: Sequence[str]) -
     if os.name == "posix":
         mode = target.stat().st_mode
         os.chmod(target, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _conversation_item(entry: _WireChatMessage) -> AssistantTurn | ToolResultTurn | UserTurn:
+    """One ordered conversation item from a validated wire message (ADR 0045)."""
+    if entry.role == "user":
+        return UserTurn(text=entry.content)
+    if entry.role == "assistant":
+        return AssistantTurn(
+            text=entry.content,
+            tool_calls=tuple(
+                ToolCall(call_id=call_id, name=name, arguments_json=arguments)
+                for call_id, name, arguments in entry.tool_calls
+            ),
+        )
+    assert entry.tool_call_id is not None
+    return ToolResultTurn(call_id=entry.tool_call_id, text=entry.content)
+
+
+def _parse_wire_tool_choice(raw: object, offered_tools: tuple[ToolSchema, ...]) -> ToolChoice:
+    """Validate the wire tool choice against the tools actually offered (ADR 0045)."""
+    if raw is None:
+        return ToolChoice()
+    if not isinstance(raw, dict):
+        raise ModelProviderError(MODEL_REQUEST_REJECTED)
+    item = cast("dict[str, object]", raw)
+    kind_raw = item.get("kind")
+    name = item.get("name")
+    if kind_raw not in ("auto", "none", "required", "named"):
+        raise ModelProviderError(MODEL_REQUEST_REJECTED)
+    if kind_raw == "named" and not isinstance(name, str):
+        raise ModelProviderError(MODEL_REQUEST_REJECTED)
+    if kind_raw != "named" and name is not None:
+        raise ModelProviderError(MODEL_REQUEST_REJECTED)
+    offered_names = {tool.name for tool in offered_tools}
+    if kind_raw in ("required", "named") and not offered_names:
+        raise ModelProviderError(MODEL_REQUEST_REJECTED)
+    if kind_raw == "named" and cast("str", name) not in offered_names:
+        raise ModelProviderError(MODEL_REQUEST_REJECTED)
+    return ToolChoice(
+        kind=ToolChoiceKind(cast("str", kind_raw)),
+        name=name if isinstance(name, str) else None,
+    )
 
 
 def granted_tools_payload(

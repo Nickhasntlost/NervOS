@@ -1385,6 +1385,76 @@ tool choice would need a core change.
   vendor-shaped rejections that never reach the wire, both discovery listings, env);
   `packages/nervos-package-host/tests/test_process_agent_environment.py`.
 - ADR: `docs/adr/0044-bridge-api-shapes.md` (Status: ACCEPTED).
+
+**Bridge Tool Choice and Tool-Aware History (ADR 0045) — IMPLEMENTED**:
+
+- Core: `ModelRequest.tool_choice` (auto/none/required/named via `ToolChoice`) and the
+  bridge-only ordered `conversation` field (`UserTurn` joins `AssistantTurn`/
+  `ToolResultTurn`); both optional, defaults byte-identical, nothing persisted.
+- Adapters: each mode maps to the vendor's real parameter — OpenAI
+  `tool_choice` ("none"/"required"/`{"type":"function","name":N}`), Anthropic
+  `{"type":"none"|"any"|"tool",...}`, Gemini `FunctionCallingConfigMode`
+  (NONE/ANY + `allowed_function_names`); ordered conversation renders per provider.
+- Worker: parses the wire `tool_choice` (undeclared named → `model_request_rejected`)
+  and maps a conversation whose tool traffic precedes a later user message onto
+  `conversation` instead of refusing.
+- Shim: all four routes accept forced choice (OpenAI `"required"`/`{"type":"function"}`,
+  Anthropic `{"type":"any"|"tool"}`, Gemini `mode: ANY` (+ `allowedFunctionNames`)) and
+  multi-turn tool conversations; the ADR 0042 refusals are removed.
+- Tests: `packages/nervos-models/tests/unit/test_tool_choice_and_conversation.py`
+  (exact per-adapter kwargs + byte-identical defaults),
+  `apps/worker/tests/unit/test_model_tool_mediation.py` (the former multi-turn refusal
+  test now asserts success — renamed
+  `test_tool_traffic_before_a_later_user_turn_now_succeeds_via_conversation`),
+  `apps/worker/tests/integration/test_real_e2e_shim_tool_choice_multiturn.py` (8
+  real-socket tests).
+- ADR: `docs/adr/0045-bridge-tool-choice-and-tool-history.md` (Status: ACCEPTED).
+
+**Real-host launch verification (Phase A1) — IMPLEMENTED**:
+
+`apps/worker/tests/integration/test_real_host_process_launch.py` spawns the real
+`python -m nervos_package_host` subprocess and drives it over real wire frames: the
+child sees the full bridge environment, the run input arrives on its stdin, its stdout
+becomes the `run_result`, a failing child yields `run_error`, and a `cancel` frame kills
+the whole child tree. The host also honors the initialize frame's tool list on the
+real path (`/mcp tools/call` enforces the run's real grants) and cancels the child tree
+(process group on POSIX, `taskkill /T` on Windows).
+
+**Verified with real SDKs** (`scripts/bridge_sdk_smoke.py --node-dir`; throwaway dirs
+outside the repo, default client settings, loopback only):
+
+| SDK (Node) | Version | Cases (all passed) |
+|---|---|---|
+| `openai` (Node) | 7.43.0 | chat_plain, chat_stream, chat_tool, responses_plain, responses_stream — 5/5 |
+| `@anthropic-ai/sdk` | 1.3.0 | messages_plain, messages_stream, messages_tool — 3/3 |
+| `@google/genai` | 2.31.0 | generate_plain, generate_stream, generate_tool — 3/3 |
+| `ai` (Vercel) | 7.0.153 | generate_plain, generate_stream, generate_tool, generate_structured (forced tool) — 4/4 |
+
+One shim fix came out of the Node run: the Vercel AI SDK sends plain `{role, content}`
+input items without a `"type"` field, which the Responses route rejected; those are now
+treated as message items (regression covered by the smoke run; the route's typed-item
+behavior is unchanged).
+
+**Bundling (ADR 0043) — item 3 RESOLVED by "bundle ships its runtime"**:
+
+A Node package ships its own `node` binary and `node_modules` as bundle assets and
+launches them via `runtime.command: ["bin/node", "app.js"]`, possible because item 1
+makes `command[0]` executable at materialization. Validated by
+`packages/nervos-core/tests/unit/test_node_bundle_command.py`.
+
+**Linux verification kit — WRITTEN, NOT RUN ([unverified])**:
+
+`packages/nervos-core/tests/integration/test_linux_bridge_verification.py` (4 skip-unless-
+Linux-with-bwrap tests), `scripts/verify_linux_bridge.sh`, and
+`docs/linux-verification-runbook.md`. Loopback in bubblewrap remains `[unverified]`
+until the owner runs the kit on Linux.
+
+**Known stop (Phase A2)**: process-kind packages cannot pass the real install path yet —
+`SqlInstalledPackageDefinitionSource` persists a `module:symbol` entrypoint
+(`packages/nervos-core/src/nervos_core/infrastructure/database/packages.py:133`), which a
+process manifest does not have. The full journey is written and skipped with that reason
+(`apps/worker/tests/integration/test_real_worker_process_package.py`); unblocking it
+requires a change to DB-persisted definition fields and is out of scope here.
 - Dependency bundling investigation (no code change):
   `docs/adr/0043-bridge-agent-dependency-bundling.md` (Status: PROPOSED).
 

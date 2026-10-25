@@ -9,6 +9,7 @@ import io
 import json
 import os
 import secrets
+import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -47,6 +48,29 @@ from nervos_package_host.wire import (
     read_frame,
     write_frame,
 )
+
+
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """Kill the child and everything it spawned (best effort, per platform)."""
+    if process.returncode is not None:
+        return
+    if os.name == "posix":
+        import signal
+
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+    else:
+        # Windows has no process groups for plain exec; taskkill walks the tree.
+        with contextlib.suppress(OSError):
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        process.kill()
 
 
 class _BoundedLog(io.TextIOBase):
@@ -208,13 +232,20 @@ async def _run_process_agent(
     protocol_out: BinaryIO,
     command: list[str],
     package_root: Path,
+    granted_tools: list[dict[str, object]] | None = None,
 ) -> None:
     """Run a generic process agent with the loopback shim."""
     token = secrets.token_urlsafe(32)
     config = ShimConfig(token=token, request_timeout=60.0, max_requests=1000)
 
+    # The cancel frame arrives on the wire reader; killing the child tree ends the
+    # run (ADR 0041: "honors cancel by killing the child tree").
+    child_processes: list[asyncio.subprocess.Process] = []
+
     async def forward_wire_message(message: dict[str, object]) -> None:
-        """No-op hook; response routing happens inside ShimServer._read_loop."""
+        """Response routing happens inside ShimServer; the host only honors cancel."""
+        if message.get("type") == "cancel" and child_processes:
+            _kill_process_tree(child_processes[0])
 
     # Read run_request before starting the shim reader so the two never compete
     # for the same stdin bytes.
@@ -224,16 +255,21 @@ async def _run_process_agent(
     payload = cast(dict[str, object], request["payload"])
     input_text = cast(str, payload.get("input_text", ""))
 
-    # Start the shim server
+    # Start the shim server. The initialize frame's granted tools were consumed by
+    # main() before this coroutine, so they are handed to the shim directly: that
+    # is what makes /mcp tools/call enforce the run's real grants on this path.
     shim_server = ShimServer(config, protocol_in, protocol_out, forward_wire_message)
     shim_server.start()
     port = shim_server.port
+    if granted_tools:
+        shim_server.state.tools_info = list(granted_tools)
 
     # Prepare environment for the child process
     env = os.environ.copy()
     env.update(process_agent_environment(f"http://127.0.0.1:{port}", token))
 
-    # Spawn the child process
+    # Spawn the child process. A fresh process group/session makes a later cancel
+    # able to take down the whole tree, not just the direct child.
     process = await asyncio.create_subprocess_exec(
         *command,
         stdin=asyncio.subprocess.PIPE,
@@ -241,7 +277,9 @@ async def _run_process_agent(
         stderr=asyncio.subprocess.PIPE,
         cwd=package_root,
         env=env,
+        start_new_session=os.name == "posix",
     )
+    child_processes.append(process)
 
     # Send input to child's stdin
     if process.stdin is not None:
@@ -336,6 +374,11 @@ async def _run_session(protocol_in: BinaryIO, protocol_out: BinaryIO, entrypoint
                 }
                 for tool in request.tools
             ]
+        if request.tool_choice is not None:
+            choice: dict[str, object] = {"kind": request.tool_choice.kind}
+            if request.tool_choice.name is not None:
+                choice["name"] = request.tool_choice.name
+            payload["tool_choice"] = choice
         response = rpc("model_request", payload)
         stop_reason = response.get("stop_reason")
         tool_calls: list[ToolCall] = []
@@ -477,8 +520,18 @@ def main() -> int:
                 package_root = Path.cwd()
             if not package_root.is_dir():
                 raise HostProtocolError("package_root does not exist or is not a directory")
+            raw_tools = payload.get("tools")
+            granted_tools: list[dict[str, object]] = []
+            if isinstance(raw_tools, list):
+                granted_tools = [
+                    cast("dict[str, object]", item)
+                    for item in cast("list[object]", raw_tools)
+                    if isinstance(item, dict)
+                ]
             write_frame(protocol_out, _message("ready", str(initialize["request_id"]), {}))
-            asyncio.run(_run_process_agent(protocol_in, protocol_out, command, package_root))
+            asyncio.run(
+                _run_process_agent(protocol_in, protocol_out, command, package_root, granted_tools)
+            )
             return 0
         else:
             entrypoint = payload.get("entrypoint")

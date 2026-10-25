@@ -17,7 +17,7 @@ On Windows, the Job Object containment adapter reports `ContainmentTier.RESOURCE
 We will define a **Generic Process Agent Bridge** allowing any executable to run as a sandboxed NervOS agent, subject to:
 
 1. **Transport**: Design A — The package host (already inside the sandbox) starts a loopback shim serving an OpenAI-compatible `/v1/chat/completions` endpoint and an MCP endpoint. The shim translates every request into the EXISTING `model_request` / `tool_request` frames over the EXISTING stdio pipe to the Worker. Grants, approvals, and audit stay in the Worker. The foreign agent runs as a child in the same sandbox, with base URL and per-run random API key supplied via environment.
-   - `[unverified]` Whether 127.0.0.1 works inside the Linux bubblewrap network namespace; Linux-only test added (skipped on non-Linux).
+   - `[unverified]` Whether 127.0.0.1 works inside the Linux bubblewrap network namespace; Linux-only test added (skipped on non-Linux). See docs/linux-verification-runbook.md — still unverified until an owner run.
 
 2. **Manifest**: Extend `runtime` section with optional `kind` (values: `python` [default], `process`). For `process`, require `runtime.command`: a non-empty list of strings (first item a relative path inside the package bundle). Validate: no absolute paths, no `..`, no shell strings, max 32 items, each max 512 chars. `runtime.entrypoint` and `runtime.python` stay required only for `python` kind. Files: `packages/nervos-core/src/nervos_core/application/package_manifest.py` and `packages/nervos-core/src/nervos_core/domain/packages.py`.
 

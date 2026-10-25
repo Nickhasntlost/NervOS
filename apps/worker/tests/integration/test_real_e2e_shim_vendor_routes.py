@@ -238,7 +238,7 @@ def main():
         "max_tokens": 100,
         "messages": [{"role": "user", "content": "hi"}],
         "tools": TOOLS,
-        "tool_choice": {"type": "any"},
+        "tool_choice": {"type": "tool", "name": "missing"},
     }, 400, "ANTHROPIC_CHOICE_400")
     expect_error(base, key, {
         "model": "claude-fake",
@@ -667,7 +667,9 @@ def main():
     expect_error(base, key, {
         "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
         "tools": TOOLS,
-        "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+        "toolConfig": {
+            "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["missing"]}
+        },
     }, 400, "GEMINI_CHOICE_400")
     expect_error(base, key, {
         "contents": [{"role": "user", "parts": [

@@ -18,8 +18,15 @@ import os
 import secrets
 import threading
 import time
+from pathlib import Path
 from typing import BinaryIO, cast
 
+from bridge_node_cases import (
+    NODE_ANTHROPIC_CASE,
+    NODE_GEMINI_CASE,
+    NODE_OPENAI_CASE,
+    NODE_VERCEL_CASE,
+)
 from nervos_package_host.__main__ import process_agent_environment
 from nervos_package_host.bridge_shim import ShimConfig, ShimServer
 from nervos_package_host.wire import (
@@ -388,11 +395,18 @@ def _fake_worker(
         if roles and roles[-1] == "tool":
             return {"output_text": TOOL_FINAL_TEXT, "stop_reason": "stop", "usage": usage}
         if payload.get("tools") is not None:
+            # Honor a forced named choice: the "model" calls the tool it was told to call.
+            choice = payload.get("tool_choice")
+            forced_name = ECHO_TOOL
+            if isinstance(choice, dict):
+                item = cast("dict[str, object]", choice)
+                if item.get("kind") == "named" and isinstance(item.get("name"), str):
+                    forced_name = cast("str", item["name"])
             return {
                 "output_text": "",
                 "stop_reason": "tool_use",
                 "usage": usage,
-                "tool_calls": [{"id": "call-1", "name": ECHO_TOOL, "arguments": '{"value": 7}'}],
+                "tool_calls": [{"id": "call-1", "name": forced_name, "arguments": '{"value": 7}'}],
             }
         return {"output_text": PLAIN_TEXT, "stop_reason": "stop", "usage": usage}
 
@@ -451,17 +465,19 @@ async def _run_sdk_child(
     script: str,
     stdin_text: str,
     env: dict[str, str],
+    *,
+    node_script: str | None = None,
 ) -> tuple[int, str, str]:
     # The child runs through the asyncio subprocess API, never a blocking call:
     # the wire reader resolves shim futures on this loop while the child works.
+    argv = [sdk_python, node_script] if node_script is not None else [sdk_python, "-c", script]
     process = await asyncio.create_subprocess_exec(
-        sdk_python,
-        "-c",
-        script,
+        *argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
+        cwd=Path(node_script).resolve().parent if node_script else None,
     )
     stdout_bytes, stderr_bytes = await asyncio.wait_for(
         process.communicate(stdin_text.encode("utf-8")), timeout=120
@@ -474,7 +490,7 @@ async def _run_sdk_child(
     )
 
 
-async def _serve_and_run(sdk_python: str) -> int:
+async def _serve_and_run(sdk_python: str, node_dir: str | None) -> int:
     token = "smoke-" + secrets.token_hex(16)
     to_shim_read_fd, to_shim_write_fd = os.pipe()
     from_shim_read_fd, from_shim_write_fd = os.pipe()
@@ -517,24 +533,23 @@ async def _serve_and_run(sdk_python: str) -> int:
             code, stdout, stderr = await _run_sdk_child(
                 sdk_python, script, '{"input": "run"}\n', env
             )
-            for line in stdout.splitlines():
-                line = line.strip()
-                if line.startswith("VERSION "):
-                    versions[sdk_name] = line[len("VERSION ") :].split("|", 1)[1]
-                elif line.startswith("RESULT "):
-                    fields = line[len("RESULT ") :].split("|")
-                    version = versions.get(sdk_name, "?")
-                    if len(fields) >= 3 and fields[2] == "PASS":
-                        print(f"PASS {sdk_name}=={version} {fields[1]}")
-                    else:
-                        failures += 1
-                        detail = "|".join(fields[3:]) if len(fields) > 3 else "?"
-                        print(f"FAIL {sdk_name}=={version} {fields[1]} :: {detail}")
-            if code != 0:
-                failures += 1
-                print(f"FAIL {sdk_name} interpreter exited {code}:")
-                for line in stderr.strip().splitlines()[-8:]:
-                    print(f"  {line}")
+            failures += _report_child(sdk_name, code, stdout, stderr, versions)
+        if node_dir is not None:
+            node_bin = _node_bin()
+            node_versions = _node_versions(Path(node_dir))
+            versions.update(node_versions)
+            for sdk_name, script in NODE_CASES:
+                script_path = Path(node_dir) / f"_smoke_{sdk_name.replace('/', '_')}.mjs"
+                script_path.write_text(script, encoding="utf-8")
+                code, stdout, stderr = await _run_sdk_child(
+                    node_bin,
+                    "",
+                    '{"input": "run"}\n',
+                    env,
+                    node_script=str(script_path),
+                )
+                failures += _report_child(sdk_name, code, stdout, stderr, versions)
+
     finally:
         await server.stop()
         worker_write.close()
@@ -550,6 +565,63 @@ async def _serve_and_run(sdk_python: str) -> int:
     return 1 if failures else 0
 
 
+NODE_CASES: tuple[tuple[str, str], ...] = (
+    ("openai", NODE_OPENAI_CASE),
+    ("anthropic", NODE_ANTHROPIC_CASE),
+    ("google-genai", NODE_GEMINI_CASE),
+    ("vercel-ai", NODE_VERCEL_CASE),
+)
+
+
+def _node_bin() -> str:
+    import shutil
+
+    node = shutil.which("node")
+    if node is None:
+        raise SystemExit("node is not installed; cannot run the Node SDK smoke cases")
+    return node
+
+
+def _node_versions(node_dir: Path) -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for name in ("openai", "@anthropic-ai/sdk", "@google/genai", "ai"):
+        package_json = node_dir / "node_modules" / name / "package.json"
+        if package_json.exists():
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+            versions[name] = str(data.get("version", "?"))
+    return versions
+
+
+def _report_child(
+    sdk_name: str,
+    code: int,
+    stdout: str,
+    stderr: str,
+    versions: dict[str, str],
+) -> int:
+    """Print PASS/FAIL lines for one child; return its failure count."""
+    failures = 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("VERSION "):
+            versions[sdk_name] = line[len("VERSION ") :].split("|", 1)[1]
+        elif line.startswith("RESULT "):
+            fields = line[len("RESULT ") :].split("|")
+            version = versions.get(sdk_name, "?")
+            if len(fields) >= 3 and fields[2] == "PASS":
+                print(f"PASS {sdk_name}=={version} {fields[1]}")
+            else:
+                failures += 1
+                detail = "|".join(fields[3:]) if len(fields) > 3 else "?"
+                print(f"FAIL {sdk_name}=={version} {fields[1]} :: {detail}")
+    if code != 0:
+        failures += 1
+        print(f"FAIL {sdk_name} interpreter exited {code}:")
+        for line in stderr.strip().splitlines()[-8:]:
+            print(f"  {line}")
+    return failures
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -557,12 +629,19 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="path to the throwaway interpreter with openai/anthropic/google-genai installed",
     )
+    parser.add_argument(
+        "--node-dir",
+        help=(
+            "path to a throwaway directory with node_modules containing openai, "
+            "@anthropic-ai/sdk, @google/genai, ai and @ai-sdk/openai"
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    return asyncio.run(_serve_and_run(args.sdk_python))
+    return asyncio.run(_serve_and_run(args.sdk_python, args.node_dir))
 
 
 if __name__ == "__main__":

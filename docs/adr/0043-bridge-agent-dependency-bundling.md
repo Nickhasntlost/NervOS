@@ -1,7 +1,7 @@
 # ADR 0043 — Bridge Agent Dependency Bundling
 
-**Status: ACCEPTED for items 1 and 2 (implemented); item 3 (Node runtime) explicitly
-DEFERDED.** The investigation below stands as written; the accepted items are the two
+**Status: ACCEPTED — items 1 and 2 implemented; item 3 RESOLVED by "bundle ships
+its runtime" (no Worker-side Node runtime).** The investigation below stands as written; the accepted items are the two
 smallest changes it identified, in exactly the decided forms:
 
 1. After a process-kind package is materialized, on POSIX only, the executable bit is
@@ -11,7 +11,11 @@ smallest changes it identified, in exactly the decided forms:
 2. `process_agent_environment` exports `NERVOS_PACKAGE_PYTHON`, set to the interpreter
    of the package environment (the host's own `sys.executable` inside the sandbox).
 
-Item 3 — a Node runtime artifact — stays out of scope.
+Item 3 is RESOLVED differently than first proposed: a Node package ships its own
+`node` binary and `node_modules` inside its bundle (as declared assets) and launches
+them through `runtime.command` (e.g. `command: ["bin/node", "app.js"]`). That works
+because item 1 makes `command[0]` executable at materialization. No Worker-side Node
+runtime is built and no new runtime artifact kind is added.
 
 ## Question
 
@@ -86,10 +90,10 @@ the smallest change that would support each shape?
    interpreter in `process_agent_environment`, so a Python foreign agent's command can
    be `["bin/agent.sh"]` (or the command may reference `$NERVOS_PACKAGE_PYTHON`) and
    get the same offline site-packages `python`-kind packages use. No new install step.
-3. **Node (bigger, optional)**: a Node runtime artifact analogous to the SDK wheel —
-   downloaded/verified once into the store and `--ro-bind` mounted like the Python
-   environment — plus `NERVOS_PACKAGE_NODE` in the child environment. `node_modules`
-   needs no support of its own: assets already carry it read-only.
+3. **Node (RESOLVED by bundling)**: no Worker-side runtime. The bundle carries
+   `bin/node` + `node_modules` as assets; `runtime.command: ["bin/node", "app.js"]`
+   launches them, with item 1's exec bit making `bin/node` runnable. Validated by
+   `packages/nervos-core/tests/unit/test_node_bundle_command.py`.
 
 Items 1 and 2 are additive, manifest-compatible, and need no Worker/core/wire change;
 they are implemented as `prepare_process_command_target` (exec bit + containment

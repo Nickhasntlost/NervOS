@@ -19,10 +19,11 @@ refactor.
 
 ### Owner decisions
 
-1. **Same limits as ADR 0042**: `tool_choice` auto/none only (anything else gets the
-   vendor's own 400 shape); no images, audio, files, embeddings, or provider-hosted
-   tools (vendor-style 400); streaming is **replay** of the complete result in the
-   vendor's SSE format, never incremental generation.
+1. **Limits as amended by ADR 0045**: forced `tool_choice` (required and named) is now
+   honored on every route, and multi-turn conversations with a tool exchange before a
+   later user message are carried in order; images, audio, files, embeddings, and
+   provider-hosted tools still get the vendor-style 400; streaming is **replay** of
+   the complete result in the vendor's SSE format, never incremental generation.
 2. **No new shipped third-party dependencies**; no live Linux/sandbox/provider calls.
 3. **Every protection applies to every route**: 127.0.0.1 binding, Host header check,
    per-run key auth, 1 MiB body cap, request cap, per-request timeout. Auth accepts

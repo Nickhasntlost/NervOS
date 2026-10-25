@@ -242,11 +242,13 @@ def main():
             ],
         }],
     }, 400, "IMAGE_400")
+    # ADR 0045: "required" is now honored; a named choice for an unoffered tool
+    # is still refused with 400.
     expect_error({
         "model": "fake",
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function", "function": {"name": "echo"}}],
-        "tool_choice": "required",
+        "tool_choice": {"type": "function", "name": "missing"},
     }, 400, "CHOICE_400")
 
     body = json.dumps({"model": "fake", "messages": [{"role": "user", "content": "hi"}]}).encode()

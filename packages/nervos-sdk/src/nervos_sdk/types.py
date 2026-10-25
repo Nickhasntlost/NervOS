@@ -96,6 +96,23 @@ class ToolCall:
             object.__setattr__(self, "arguments", _freeze_mapping(self.arguments))
 
 
+@dataclass(frozen=True, slots=True)
+class ToolChoice:
+    """How a request wants tools chosen (ADR 0045). Defaults to automatic."""
+
+    kind: str = "auto"  # "auto" | "none" | "required" | "named"
+    name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("auto", "none", "required", "named"):
+            raise ValueError("tool choice kind must be auto, none, required, or named")
+        if self.kind == "named":
+            if not self.name:
+                raise ValueError("a named tool choice requires a tool name")
+        elif self.name is not None:
+            raise ValueError("only a named tool choice carries a tool name")
+
+
 # The stop reason a result carries when the model asked for tools instead of text;
 # the same value the core normalization uses, so the wire never translates it.
 STOP_REASON_TOOL_USE = "tool_use"
@@ -111,6 +128,7 @@ class ModelRequest:
     max_output_tokens: int | None = None
     metadata: Mapping[str, JSONValue] = field(default_factory=_json_mapping)
     tools: Sequence[ToolDefinition] = ()
+    tool_choice: ToolChoice | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "messages", tuple(self.messages))

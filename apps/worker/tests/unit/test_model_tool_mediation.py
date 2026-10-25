@@ -12,8 +12,10 @@ from nervos_core.application.model_completion import (
     ModelResponse,
     StopOutcome,
     ToolCall,
+    ToolChoiceKind,
     ToolResultTurn,
     ToolSchema,
+    UserTurn,
 )
 from nervos_core.application.model_completion import (
     ModelRequest as CoreModelRequest,
@@ -144,26 +146,75 @@ async def test_tool_free_request_is_unchanged() -> None:
 
 
 @pytest.mark.anyio
-async def test_tool_traffic_before_the_current_user_turn_is_refused() -> None:
+async def test_tool_traffic_before_a_later_user_turn_now_succeeds_via_conversation() -> None:
+    """ADR 0045 changed this from a refusal to the ordered-conversation mapping.
+
+    (The pre-ADR test name was test_tool_traffic_before_the_current_user_turn_is_refused.)
+    """
     completion = _FakeCompletion(ModelResponse(text="hi", model_provider="fake", model_name="fake"))
+    result = await _adapter().complete_model(
+        completion,
+        _frame(
+            {
+                "messages": [
+                    {"role": "user", "content": "first"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": "call-1", "name": "echo", "arguments": "{}"}],
+                    },
+                    {"role": "tool", "content": "ok", "tool_call_id": "call-1"},
+                    {"role": "user", "content": "second"},
+                ],
+            }
+        ),
+        "default-model",
+    )
+    request = completion.request
+    assert request is not None
+    assert [type(item) for item in request.conversation] == [
+        UserTurn,
+        AssistantTurn,
+        ToolResultTurn,
+        UserTurn,
+    ]
+    assert request.history == ()
+    assert request.turns == ()
+    assert request.user_text == "second"
+    assert result["output_text"] == "hi"
+
+
+@pytest.mark.anyio
+async def test_forced_tool_choice_maps_and_an_undeclared_named_choice_is_refused() -> None:
+    completion = _FakeCompletion(ModelResponse(text="hi", model_provider="fake", model_name="fake"))
+    await _adapter().complete_model(
+        completion,
+        _frame(
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "tool_choice": {"kind": "required"},
+                "tools": [{"name": "echo", "description": "Echo", "parameters": {}}],
+            }
+        ),
+        "default-model",
+        declared_tools=frozenset({"echo"}),
+    )
+    request = completion.request
+    assert request is not None
+    assert request.tool_choice.kind is ToolChoiceKind.REQUIRED
+
     with pytest.raises(ModelProviderError) as error:
         await _adapter().complete_model(
             completion,
             _frame(
                 {
-                    "messages": [
-                        {"role": "user", "content": "first"},
-                        {
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [{"id": "call-1", "name": "echo", "arguments": "{}"}],
-                        },
-                        {"role": "tool", "content": "ok", "tool_call_id": "call-1"},
-                        {"role": "user", "content": "second"},
-                    ],
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tool_choice": {"kind": "named", "name": "undeclared"},
+                    "tools": [{"name": "echo", "description": "Echo", "parameters": {}}],
                 }
             ),
             "default-model",
+            declared_tools=frozenset({"echo"}),
         )
     assert error.value.code == MODEL_REQUEST_REJECTED
 

@@ -317,7 +317,7 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
         request = cast("dict[str, object]", parsed)
 
         normalized_messages = self._parse_chat_messages(request)
-        offered_tools = self._parse_chat_tools(request)
+        offered_tools, wire_tool_choice = self._parse_chat_tools(request)
         stream = request.get("stream") is True
         include_usage = self._stream_include_usage(request)
 
@@ -342,6 +342,8 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
         }
         if offered_tools:
             payload["tools"] = offered_tools
+        if wire_tool_choice is not None:
+            payload["tool_choice"] = wire_tool_choice
 
         # ADR 0042 owner decision: no real token streaming. The full result is
         # awaited first, then replayed as valid SSE for unmodified SDK clients.
@@ -487,12 +489,14 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
             calls.append({"id": call_id, "name": name, "arguments": arguments_text})
         return calls
 
-    def _parse_chat_tools(self, request: dict[str, object]) -> list[dict[str, object]]:
+    def _parse_chat_tools(
+        self, request: dict[str, object]
+    ) -> tuple[list[dict[str, object]], dict[str, object] | None]:
         if request.get("functions") is not None:
             raise ShimError("functions are not supported; send tools", HTTPStatus.BAD_REQUEST)
         raw_tools = request.get("tools")
         if raw_tools is None:
-            return []
+            return [], None
         if not isinstance(raw_tools, list):
             raise ShimError("tools must be an array", HTTPStatus.BAD_REQUEST)
         tools: list[dict[str, object]] = []
@@ -525,21 +529,7 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
             if isinstance(parameters, dict):
                 tool["parameters"] = parameters
             tools.append(tool)
-        return self._apply_tool_choice(request.get("tool_choice"), tools)
-
-    def _apply_tool_choice(
-        self, raw: object, tools: list[dict[str, object]]
-    ) -> list[dict[str, object]]:
-        if raw is None or raw == "auto":
-            return tools
-        if raw == "none":
-            # "none" is representable: the offered tools simply never reach the model.
-            return []
-        if isinstance(raw, str):
-            raise ShimError(f"tool_choice '{raw}' is not supported", HTTPStatus.BAD_REQUEST)
-        if isinstance(raw, dict):
-            raise ShimError("named tool_choice is not supported", HTTPStatus.BAD_REQUEST)
-        raise ShimError("tool_choice must be a string", HTTPStatus.BAD_REQUEST)
+        return _resolve_tool_choice(request.get("tool_choice"), tools, _openai_named_choice)
 
     def _stream_include_usage(self, request: dict[str, object]) -> bool:
         options = request.get("stream_options")
@@ -710,7 +700,7 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
             raise ShimError("anthropic-version header is required", HTTPStatus.BAD_REQUEST)
 
         messages = self._parse_anthropic_messages(request)
-        offered_tools = self._parse_anthropic_tools(request)
+        offered_tools, wire_tool_choice = self._parse_anthropic_tools(request)
         model = request.get("model")
         if not isinstance(model, str) or not model:
             raise ShimError("model is required", HTTPStatus.BAD_REQUEST)
@@ -727,6 +717,8 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
         }
         if offered_tools:
             payload["tools"] = offered_tools
+        if wire_tool_choice is not None:
+            payload["tool_choice"] = wire_tool_choice
 
         response = self._request_model(state, payload)
         text, tool_calls, stop_reason, usage = self._model_result_parts(response)
@@ -880,10 +872,12 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
                 messages.append({"role": "user", "content": "".join(text_parts)})
         return messages
 
-    def _parse_anthropic_tools(self, request: dict[str, object]) -> list[dict[str, object]]:
+    def _parse_anthropic_tools(
+        self, request: dict[str, object]
+    ) -> tuple[list[dict[str, object]], dict[str, object] | None]:
         raw_tools = request.get("tools")
         if raw_tools is None:
-            return []
+            return [], None
         if not isinstance(raw_tools, list):
             raise ShimError("tools must be an array", HTTPStatus.BAD_REQUEST)
         tools: list[dict[str, object]] = []
@@ -907,7 +901,9 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
             if isinstance(input_schema, dict):
                 tool["parameters"] = input_schema
             tools.append(tool)
-        return self._apply_tool_choice(_anthropic_tool_choice(request.get("tool_choice")), tools)
+        return _resolve_tool_choice(
+            _anthropic_choice_form(request.get("tool_choice")), tools, _flat_named_choice
+        )
 
     def _send_anthropic_stream(
         self,
@@ -1009,7 +1005,7 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
         # ``store`` is accepted and ignored: the shim is stateless per run.
 
         messages = self._parse_responses_input(request)
-        offered_tools = self._parse_responses_tools(request)
+        offered_tools, wire_tool_choice = self._parse_responses_tools(request)
         model = request.get("model")
         if not isinstance(model, str) or not model:
             raise ShimError("model is required", HTTPStatus.BAD_REQUEST)
@@ -1026,6 +1022,8 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
         }
         if offered_tools:
             payload["tools"] = offered_tools
+        if wire_tool_choice is not None:
+            payload["tool_choice"] = wire_tool_choice
 
         response = self._request_model(state, payload)
         text, tool_calls, stop_reason, usage = self._model_result_parts(response)
@@ -1116,16 +1114,36 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
                         HTTPStatus.BAD_REQUEST,
                     )
                 messages.append({"role": "tool", "content": output_text, "tool_call_id": call_id})
+            elif item_type is None:
+                # The Vercel AI SDK sends plain {role, content} items without a type;
+                # treat them exactly like typed message items (ADR 0045 real-SDK fix).
+                role = item.get("role")
+                if role not in ("user", "assistant", "system", "developer"):
+                    raise ShimError("input item role is not supported", HTTPStatus.BAD_REQUEST)
+                content = item.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = _responses_text_of_parts(cast("list[object]", content))
+                else:
+                    raise ShimError(
+                        "input item content must be a string or content parts",
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                wire_role = "system" if role in ("system", "developer") else str(role)
+                messages.append({"role": wire_role, "content": text})
             else:
                 raise ShimError(
                     f"input item type '{item_type}' is not supported", HTTPStatus.BAD_REQUEST
                 )
         return messages
 
-    def _parse_responses_tools(self, request: dict[str, object]) -> list[dict[str, object]]:
+    def _parse_responses_tools(
+        self, request: dict[str, object]
+    ) -> tuple[list[dict[str, object]], dict[str, object] | None]:
         raw_tools = request.get("tools")
         if raw_tools is None:
-            return []
+            return [], None
         if not isinstance(raw_tools, list):
             raise ShimError("tools must be an array", HTTPStatus.BAD_REQUEST)
         tools: list[dict[str, object]] = []
@@ -1160,7 +1178,7 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
             if isinstance(parameters, dict):
                 tool["parameters"] = parameters
             tools.append(tool)
-        return self._apply_tool_choice(request.get("tool_choice"), tools)
+        return _resolve_tool_choice(request.get("tool_choice"), tools, _flat_named_choice)
 
     def _responses_document(
         self,
@@ -1313,7 +1331,7 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
             )
 
         messages = self._parse_gemini_contents(request)
-        offered_tools = self._parse_gemini_tools(request)
+        offered_tools, wire_tool_choice = self._parse_gemini_tools(request)
         generation = request.get("generationConfig")
         generation_item = (
             cast("dict[str, object]", generation) if isinstance(generation, dict) else {}
@@ -1336,6 +1354,8 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
         }
         if offered_tools:
             payload["tools"] = offered_tools
+        if wire_tool_choice is not None:
+            payload["tool_choice"] = wire_tool_choice
 
         response = self._request_model(state, payload)
         text, tool_calls, stop_reason, usage = self._model_result_parts(response)
@@ -1451,10 +1471,12 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
                 messages.append({"role": "user", "content": "".join(text_parts)})
         return messages
 
-    def _parse_gemini_tools(self, request: dict[str, object]) -> list[dict[str, object]]:
+    def _parse_gemini_tools(
+        self, request: dict[str, object]
+    ) -> tuple[list[dict[str, object]], dict[str, object] | None]:
         raw_tools = request.get("tools")
         if raw_tools is None:
-            return []
+            return [], None
         if not isinstance(raw_tools, list):
             raise ShimError("tools must be an array", HTTPStatus.BAD_REQUEST)
         tools: list[dict[str, object]] = []
@@ -1494,7 +1516,9 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
                 if isinstance(parameters, dict):
                     tool["parameters"] = parameters
                 tools.append(tool)
-        return self._apply_tool_choice(_gemini_tool_choice(request.get("toolConfig")), tools)
+        return _resolve_tool_choice(
+            _gemini_choice_form(request.get("toolConfig")), tools, _flat_named_choice
+        )
 
     def _send_gemini_stream(
         self,
@@ -1726,6 +1750,106 @@ class _ShimRequestHandler(BaseHTTPRequestHandler):
 # ------------------------------------------------------------------
 
 
+def _resolve_tool_choice(
+    raw: object,
+    tools: list[dict[str, object]],
+    named_form: Callable[[str], dict[str, object]],
+) -> tuple[list[dict[str, object]], dict[str, object] | None]:
+    """ADR 0045: resolve one vendor tool_choice onto (offered tools, wire choice).
+
+    auto/none keep the ADR 0042 semantics; required and named now forward a
+    ``tool_choice`` payload the Worker validates against the declared tools. A
+    named choice for a tool that was not offered is refused here (400).
+    """
+    if raw is None or raw == "auto":
+        return tools, None
+    if raw == "none":
+        # "none" is representable: the offered tools simply never reach the model.
+        return [], {"kind": "none"}
+    if raw == "required":
+        return tools, {"kind": "required"}
+    if isinstance(raw, str):
+        raise ShimError(f"tool_choice '{raw}' is not supported", HTTPStatus.BAD_REQUEST)
+    if not isinstance(raw, dict):
+        raise ShimError("tool_choice must be a string or an object", HTTPStatus.BAD_REQUEST)
+    name_value = cast("dict[str, object]", raw).get("name")
+    if not isinstance(name_value, str) or not name_value:
+        raise ShimError("a named tool_choice requires a tool name", HTTPStatus.BAD_REQUEST)
+    offered_names = {
+        cast("str", tool["name"]) for tool in tools if isinstance(tool.get("name"), str)
+    }
+    if name_value not in offered_names:
+        raise ShimError(
+            f"tool_choice names '{name_value}', which was not offered", HTTPStatus.BAD_REQUEST
+        )
+    return tools, {"kind": "named", "name": name_value}
+
+
+def _openai_named_choice(name: str) -> dict[str, object]:
+    return {"type": "function", "name": name}
+
+
+def _flat_named_choice(name: str) -> dict[str, object]:
+    # The resolver only inspects the name; both flat and nested vendor forms
+    # normalize to the same wire choice.
+    choice: dict[str, object] = {"name": name}
+    return choice
+
+
+def _anthropic_choice_form(raw: object) -> object:
+    """Normalize Anthropic's tool_choice object onto the resolver's vocabulary."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        choice_type = cast("dict[str, object]", raw).get("type")
+        if choice_type == "auto":
+            return "auto"
+        if choice_type == "none":
+            return "none"
+        if choice_type == "any":
+            return "required"
+        if choice_type == "tool":
+            named: dict[str, object] = dict(cast("dict[str, object]", raw))
+            return named
+        raise ShimError(
+            f"tool_choice type '{choice_type}' is not supported", HTTPStatus.BAD_REQUEST
+        )
+    raise ShimError("tool_choice must be an object with a type", HTTPStatus.BAD_REQUEST)
+
+
+def _gemini_choice_form(raw: object) -> object:
+    """Normalize Gemini's toolConfig onto the resolver's vocabulary."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ShimError("toolConfig must be an object", HTTPStatus.BAD_REQUEST)
+    config = cast("dict[str, object]", raw).get("functionCallingConfig")
+    if config is None:
+        return None
+    if not isinstance(config, dict):
+        raise ShimError("functionCallingConfig must be an object", HTTPStatus.BAD_REQUEST)
+    item = cast("dict[str, object]", config)
+    mode = item.get("mode")
+    if mode in (None, "", "AUTO"):
+        return "auto"
+    if mode == "NONE":
+        return "none"
+    if mode == "ANY":
+        names = item.get("allowedFunctionNames")
+        if isinstance(names, list) and names:
+            first = cast("list[object]", names)[0]
+            if isinstance(first, str):
+                if len(cast("list[object]", names)) > 1:
+                    raise ShimError(
+                        "toolConfig ANY with more than one allowed function is not supported",
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                return {"type": "tool", "name": first}
+            raise ShimError("allowedFunctionNames must be strings", HTTPStatus.BAD_REQUEST)
+        return "required"
+    raise ShimError(f"toolConfig mode '{mode}' is not supported", HTTPStatus.BAD_REQUEST)
+
+
 def _json_object(text: str) -> dict[str, object]:
     """Parse JSON object text, failing closed to an empty object."""
     try:
@@ -1757,23 +1881,6 @@ def _anthropic_text_of_blocks(blocks: list[object]) -> str:
     return "".join(parts)
 
 
-def _anthropic_tool_choice(raw: object) -> object:
-    """Translate Anthropic's tool_choice object onto the internal choice form."""
-    if raw is None:
-        return None
-    if isinstance(raw, dict):
-        choice_type = cast("dict[str, object]", raw).get("type")
-        if choice_type == "auto":
-            return "auto"
-        if choice_type == "none":
-            return "none"
-        if choice_type in ("any", "tool"):
-            raise ShimError(
-                f"tool_choice type '{choice_type}' is not supported", HTTPStatus.BAD_REQUEST
-            )
-    raise ShimError("tool_choice must be an object with a type", HTTPStatus.BAD_REQUEST)
-
-
 def _responses_text_of_parts(parts: list[object]) -> str:
     texts: list[str] = []
     for part in parts:
@@ -1798,26 +1905,6 @@ def _gemini_text_of_parts(parts: list[object]) -> str:
         else:
             raise ShimError("systemInstruction parts must be text", HTTPStatus.BAD_REQUEST)
     return "".join(texts)
-
-
-def _gemini_tool_choice(raw: object) -> object:
-    """Translate Gemini's toolConfig onto the internal tool-choice form."""
-    if raw is None:
-        return None
-    if isinstance(raw, dict):
-        config = cast("dict[str, object]", raw).get("functionCallingConfig")
-        if config is None:
-            return None
-        if isinstance(config, dict):
-            mode = cast("dict[str, object]", config).get("mode")
-            if mode in (None, "", "AUTO"):
-                return "auto"
-            if mode == "NONE":
-                return "none"
-            if mode == "ANY":
-                raise ShimError("toolConfig mode ANY is not supported", HTTPStatus.BAD_REQUEST)
-            raise ShimError(f"toolConfig mode '{mode}' is not supported", HTTPStatus.BAD_REQUEST)
-    raise ShimError("toolConfig must be an object", HTTPStatus.BAD_REQUEST)
 
 
 def _gemini_route(path: str) -> tuple[str, bool] | None:
