@@ -63,7 +63,7 @@ from nervos_core.application.workflows import (
 from nervos_core.domain.context import ContextSnapshotData, HistoricalMessage
 from nervos_core.domain.conversations import MessageRole
 from nervos_core.domain.runs import ModelUsage, Run
-from nervos_core.domain.tools import JsonValue, ToolDescriptor
+from nervos_core.domain.tools import JsonValue, ToolDescriptor, ToolSourceKind
 from nervos_core.domain.workflows import (
     InvalidWorkflow,
     WorkflowDecisionRequest,
@@ -238,7 +238,11 @@ class PackageExecutionAdapter:
                 agent_instance_id=run.agent_instance_id,
                 grant_cutoff_id=run.tool_grant_cutoff_id,
             )
-            initialize_tools = granted_tools_payload(descriptors=granted_descriptors, grants=grants)
+            initialize_tools = granted_tools_payload(
+                descriptors=granted_descriptors,
+                grants=grants,
+                bindings=bindings,
+            )
 
         try:
             process = await _spawn_host(
@@ -470,12 +474,26 @@ class PackageExecutionAdapter:
                         ),
                     )
                     continue
+                if message_type == "run_error":
+                    # ADR 0041: a failed process child closes the run through this
+                    # frame. The host's message is agent-controlled stderr, so only
+                    # its bounded text is logged at debug, never persisted.
+                    error_payload = cast("dict[str, object]", message["payload"])
+                    _LOGGER.debug(
+                        "package host reported run_error code=%s message=%s",
+                        error_payload.get("code", "?"),
+                        str(error_payload.get("message", ""))[:4096],
+                    )
+                    raise ModelProviderError(INTERNAL_EXECUTION_ERROR)
                 if message_type != "run_result":
                     raise HostProtocolError("package host returned an unexpected message")
                 payload = cast("dict[str, object]", message["payload"])
                 final_message = payload.get("final_message")
                 if not isinstance(final_message, str) or not final_message.strip():
                     raise HostProtocolError("package host result has no final message")
+                # The process-kind host keeps a wire reader blocked on stdin for the
+                # shim's benefit; closing our end ends that read so the host can exit.
+                process.stdin.close()
                 await asyncio.wait_for(process.wait(), _HOST_START_TIMEOUT)
                 await stderr_task
                 output_budget.consume(0)
@@ -836,23 +854,42 @@ def granted_tools_payload(
     *,
     descriptors: tuple[ToolDescriptor, ...],
     grants: tuple[ToolGrant, ...],
+    bindings: Mapping[str, Mapping[str, object]] | None = None,
 ) -> list[dict[str, object]]:
     """The initialize frame's tool list: exactly the run's granted tools.
 
-    A grant row is the authority; the matching descriptor supplies the model-facing
-    projection (``model_name`` is the name the model will call back with). A grant whose
-    definition no longer exists is skipped, and permission is still decided per
-    ``tool_request`` by the mediator, so this list can never widen access.
+    A grant row is the authority; the matching descriptor supplies the schema and
+    description. The presented name is the alias the run's bindings map to the
+    granted definition -- the same name a ``tool_request`` must use for the
+    mediator to accept it -- falling back to the descriptor's ``model_name`` when
+    no alias binding covers it. A grant whose definition no longer exists is
+    skipped, and permission is still decided per ``tool_request`` by the mediator,
+    so this list can never widen access.
     """
     by_definition = {descriptor.tool_definition_id: descriptor for descriptor in descriptors}
+    alias_by_definition: dict[int, str] = {}
+    for alias, binding in (bindings or {}).items():
+        definition_id = binding.get("definition_id")
+        if isinstance(definition_id, int):
+            alias_by_definition.setdefault(definition_id, alias)
     tools: list[dict[str, object]] = []
     for grant in grants:
         descriptor = by_definition.get(grant.tool_definition_id)
         if descriptor is None:
             continue
+        alias = alias_by_definition.get(descriptor.tool_definition_id)
+        if alias is not None:
+            name = alias
+        elif descriptor.source_kind == ToolSourceKind.BUILTIN:
+            # Plain builtin declarations (manifest tools.required) are requested by
+            # their upstream name, which is exactly what the tool_request mediator
+            # resolves when no integration alias binding covers them.
+            name = descriptor.upstream_name
+        else:
+            name = descriptor.model_name
         tools.append(
             {
-                "name": descriptor.model_name,
+                "name": name,
                 "description": descriptor.description,
                 "input_schema": descriptor.input_schema,
             }

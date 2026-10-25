@@ -92,7 +92,7 @@ from nervos_worker.registry import ReclaimLoop, WorkerRegistry
 from nervos_worker.service import Worker
 
 # Bumped only by the milestone that adds a migration. Stage H ships migrations 0016-0023.
-EXPECTED_SCHEMA_REVISION = "0024_durable_workflows"
+EXPECTED_SCHEMA_REVISION = "0025_process_kind_packages"
 
 
 def utc_now() -> datetime:

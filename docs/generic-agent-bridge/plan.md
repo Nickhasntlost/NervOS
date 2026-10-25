@@ -17,10 +17,16 @@ the initialize frame listing the run's real granted tools. See
   result)
 - A per-run model allowlist for the discovery routes (they list the last-used model
   or `nervos-model`)
-- Process-kind packages through the real install path: the durable definition model
-  requires a `module:symbol` entrypoint (`infrastructure/database/packages.py:133`),
-  so install refuses process manifests until that changes (Phase A2 stop)
 - Anything else the owner's Linux run surfaces
+
+**ADR 0046 update (process-kind install)**: migration 0025 adds `runtime_kind` to the
+installed package versions table and makes the entrypoint columns nullable under a
+kind/entrypoint pairing CHECK; the run-executable snapshot carries the stable
+`process:<command[0]>` label in the existing `package_entrypoint` column. Process-kind
+packages now install, bind, and run through the real Worker adapter with the same
+mediation and audit as python-kind (`apps/worker/tests/integration/
+test_real_worker_process_package.py`). Existing databases must run
+`uv run alembic -c apps/api/alembic.ini upgrade head`.
 
 **ADR 0045 update (tool choice + tool-aware history)**: forced `tool_choice`
 (required/named) and ordered multi-turn conversations now flow core → adapters →

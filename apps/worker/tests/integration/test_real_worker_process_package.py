@@ -4,11 +4,10 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from nervos_core.application.agent_definitions import create_composite_agent_definition_resolver
@@ -30,7 +29,12 @@ from nervos_core.application.package_installation import PackageApplicationServi
 from nervos_core.application.package_query import PackageQueryService
 from nervos_core.application.package_signing import Ed25519PackageSigner
 from nervos_core.application.package_storage import PackageStore
-from nervos_core.application.sandbox import PackageContainment, SandboxLaunch
+from nervos_core.application.sandbox import (
+    ContainmentResult,
+    ContainmentTier,
+    PackageContainment,
+    SandboxLaunch,
+)
 from nervos_core.application.tool_invocation_mediator import ToolInvocationMediator
 from nervos_core.domain.package_installation import PackageInstallAuthorization
 from nervos_core.domain.runs import RunStatus
@@ -40,6 +44,9 @@ from nervos_core.infrastructure.database.jobs import SqlAlchemyJobPersistence
 from nervos_core.infrastructure.database.packages import (
     SqlAlchemyPackageRegistryPersistence,
     SqlInstalledPackageDefinitionSource,
+)
+from nervos_core.infrastructure.database.runtime_integration import (
+    SqlAlchemyRuntimeIntegrationPersistence,
 )
 from nervos_core.infrastructure.database.tool_definitions import (
     SqlAlchemyToolDefinitionPersistence,
@@ -146,20 +153,21 @@ class _NoOpContainment(PackageContainment):
         arguments: Any,
         package_root: Path | None = None,
     ) -> SandboxLaunch:
-        del environment
+        # Honor the Worker's scrubbed environment exactly as a real adapter would
+        # hand it to the launcher: the child must not see developer credentials.
         launch = SandboxLaunch(
             command=(str(python), *arguments),
             cwd=scratch,
-            environment=os.environ.copy(),
+            environment=dict(cast("dict[str, str]", environment)),
             preexec_fn=None,
             start_new_session=False,
         )
         self.launches.append(launch)
         return launch
 
-    def establish(self, process_id: int) -> Any:
+    def establish(self, process_id: int) -> ContainmentResult:
         del process_id
-        return None
+        return ContainmentResult(ContainmentTier.RESOURCE, "fixture", "no-op double")
 
     def verify(self, process_id: int) -> None:
         del process_id
@@ -298,11 +306,13 @@ async def _process_kind_journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
             clock=lambda: NOW,
         )
         containment = _NoOpContainment()
+        integrations = SqlAlchemyRuntimeIntegrationPersistence(engine)
         adapter = PackageExecutionAdapter(
             package_store.root,
             mediator=mediator,
             registry=tool_registry,
             packages=package_registry,
+            integrations=integrations,
             containment_factory=lambda: containment,
             tool_permissions=SqlAlchemyToolPermissionPersistence(engine),
         )
@@ -343,20 +353,10 @@ async def _process_kind_journey(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         engine.dispose()
 
 
-# STOPPED (Phase A2 stop condition): the real install path cannot yet carry a
-# process-kind manifest. SqlInstalledPackageDefinitionSource.begin_install splits
-# manifest.runtime.entrypoint as "module:symbol" (infrastructure/database/packages.py:133)
-# and persists entrypoint_module/entrypoint_object; a process manifest has no entrypoint,
-# so install raises ValueError before the adapter runs. Making install tolerant needs a
-# change to DB-persisted fields and the agent-definition resolver chain, both forbidden
-# in this task. Unskip when that infrastructure lands; the journey below is complete.
-_SKIP_REASON = (
-    "process-kind install is blocked by the entrypoint-based definition model "
-    "(infrastructure/database/packages.py:133); needs a DB-persisted shape change"
-)
-
-
-@pytest.mark.skip(reason=_SKIP_REASON)
+# Phase A2 (un-skipped): ADR 0046 + migration 0025 made process-kind packages
+# installable through the real path; the entrypoint columns stay NULL for process
+# rows and the run-executable snapshot carries the stable `process:<command[0]>`
+# label in the existing package_entrypoint column.
 @pytest.mark.anyio
 async def test_process_kind_package_through_real_adapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

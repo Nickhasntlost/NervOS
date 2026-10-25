@@ -1449,15 +1449,36 @@ Linux-with-bwrap tests), `scripts/verify_linux_bridge.sh`, and
 `docs/linux-verification-runbook.md`. Loopback in bubblewrap remains `[unverified]`
 until the owner runs the kit on Linux.
 
-**Known stop (Phase A2)**: process-kind packages cannot pass the real install path yet —
-`SqlInstalledPackageDefinitionSource` persists a `module:symbol` entrypoint
-(`packages/nervos-core/src/nervos_core/infrastructure/database/packages.py:133`), which a
-process manifest does not have. The full journey is written and skipped with that reason
-(`apps/worker/tests/integration/test_real_worker_process_package.py`); unblocking it
-requires a change to DB-persisted definition fields and is out of scope here.
-- Dependency bundling investigation (no code change):
-  `docs/adr/0043-bridge-agent-dependency-bundling.md` (Status: PROPOSED).
+**Process-kind install (ADR 0046) — IMPLEMENTED** (closes the Phase A2 stop):
 
+- Migration `0025_process_kind_packages`: `runtime_kind` on
+  `installed_package_versions` (NOT NULL, default 'python', CHECK in
+  ('python','process')); `entrypoint_module`/`entrypoint_object` nullable with a
+  kind/entrypoint pairing CHECK; downgrade refuses while any process-kind row
+  exists and otherwise restores the 0024 shape exactly. Python-kind rules are as
+  strict as before. **Upgrade note: existing databases must run**
+  `uv run alembic -c apps/api/alembic.ini upgrade head` — the Worker and scheduler
+  refuse to start against the old revision.
+- Persistence/queries: process rows store NULL entrypoint columns; the
+  run-executable snapshot carries the stable non-secret label
+  `process:<command[0]>` in the existing `package_entrypoint` column (no jobs-table
+  schema change); inspect/detail expose `runtime_kind`, `command`, and optional
+  entrypoint fields; python-kind responses are unchanged in shape and values.
+- Worker: accepts the label (the `package_entrypoint is None` refusal never fires
+  for either kind), handles the ADR 0041 `run_error` frame from a failed process
+  child, and closes the host's stdin after `run_result` so the host exits cleanly.
+- API/CLI: `runtime_kind` + `command` exposed; process packages print kind and
+  command instead of `module:object`.
+- Tests: `apps/api/tests/integration/test_migration_0025.py` (upgrade keeps python
+  rows valid; CHECKs accept both kinds and reject invalid mixes; downgrade refuses
+  with process rows and restores the old shape),
+  `apps/worker/tests/integration/test_real_worker_process_package.py` (un-skipped
+  A2 journey: real signed install, mediation, audit, denial, credential isolation),
+  `packages/nervos-core/tests/unit/test_node_bundle_command.py`, and the
+  granted-tools payload unit tests updated to alias/upstream-name semantics
+  (ADR 0046: the presented name is exactly what a tool_request must use).
+- ADR: `docs/adr/0046-process-kind-package-install.md` (Status: ACCEPTED, with the
+  full consumer trace).
 **Verified with real SDKs** (`scripts/bridge_sdk_smoke.py`: real ShimServer + fake wire
 Worker; the SDKs run in a throwaway venv outside the repo, default client settings, no
 custom transport, loopback only — no live provider call):

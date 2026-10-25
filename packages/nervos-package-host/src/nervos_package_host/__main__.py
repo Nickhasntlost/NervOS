@@ -268,10 +268,14 @@ async def _run_process_agent(
     env = os.environ.copy()
     env.update(process_agent_environment(f"http://127.0.0.1:{port}", token))
 
+    # command[0] is bundle-relative (ADR 0043 item 1); resolve it against the bundle
+    # so Windows CreateProcess finds it (a bare relative .cmd is not spawned).
+    argv = [str(package_root / command[0]), *command[1:]]
+
     # Spawn the child process. A fresh process group/session makes a later cancel
     # able to take down the whole tree, not just the direct child.
     process = await asyncio.create_subprocess_exec(
-        *command,
+        *argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
