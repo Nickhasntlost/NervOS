@@ -181,6 +181,25 @@ def _nonnegative_int(value: object, field: str) -> int:
     return value
 
 
+def process_agent_environment(origin: str, token: str) -> dict[str, str]:
+    """The vendor-client environment every process agent is launched with.
+
+    ``origin`` is the shim's base origin (``http://127.0.0.1:<port>``); each SDK's
+    base-url convention gets the suffix it appends itself, and every key variable
+    carries the same per-run token. ADR 0044.
+    """
+    return {
+        "OPENAI_BASE_URL": f"{origin}/v1",
+        "OPENAI_API_KEY": token,
+        "ANTHROPIC_BASE_URL": origin,
+        "ANTHROPIC_API_KEY": token,
+        "GOOGLE_GEMINI_BASE_URL": origin,
+        "GEMINI_API_KEY": token,
+        "GOOGLE_API_KEY": token,
+        "NERVOS_MCP_URL": f"{origin}/mcp",
+    }
+
+
 async def _run_process_agent(
     protocol_in: BinaryIO,
     protocol_out: BinaryIO,
@@ -209,13 +228,7 @@ async def _run_process_agent(
 
     # Prepare environment for the child process
     env = os.environ.copy()
-    env.update(
-        {
-            "OPENAI_BASE_URL": f"http://127.0.0.1:{port}/v1",
-            "OPENAI_API_KEY": token,
-            "NERVOS_MCP_URL": f"http://127.0.0.1:{port}/mcp",
-        }
-    )
+    env.update(process_agent_environment(f"http://127.0.0.1:{port}", token))
 
     # Spawn the child process
     process = await asyncio.create_subprocess_exec(

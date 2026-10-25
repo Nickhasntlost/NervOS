@@ -10,11 +10,18 @@ the initialize frame listing the run's real granted tools. See
 `docs/adr/0042-bridge-model-tools-and-streaming.md`.
 
 **What remains**:
-- Anthropic-compatible, OpenAI Responses, and Gemini endpoints (ADR 0042 Part 2)
-- Bundling examples/package templates for foreign SDKs
+- Forced `tool_choice` (required/named/any/tool) and multi-turn tool history: both need
+  a core `ModelRequest` change (currently refused; ADR 0042 records the smallest
+  additive alternative)
+- Agent dependency bundling beyond Python wheels (exec bit, interpreter variables,
+  Node runtime) — investigated in ADR 0043 (PROPOSED), not implemented
 - Linux loopback verification inside bubblewrap (`[unverified]` as in ADR 0041)
-- Core representability for a tool exchange followed by a later user message
-  (currently refused with `model_request_rejected`; needs a core ADR)
+
+**ADR 0044 update (vendor API shapes)**: the shim now also serves Anthropic Messages
+(`/v1/messages`), OpenAI Responses (`/v1/responses`), and Gemini
+(`/v1beta/models/{model}:generateContent` and `:streamGenerateContent?alt=sse`), plus
+`GET /v1/models` and `GET /v1beta/models` discovery and the full vendor env variables.
+See `docs/adr/0044-bridge-api-shapes.md`.
 
 ---
 

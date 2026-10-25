@@ -1353,6 +1353,41 @@ text + usage, streamed tool call, 400/413 rejections that never reach the wire);
 `apps/worker/src/nervos_worker/package_execution.py`, and the test files above.
 - ADR: `docs/adr/0042-bridge-model-tools-and-streaming.md` (Status: ACCEPTED).
 
+**Bridge API Shapes (ADR 0044) — IMPLEMENTED**:
+
+The shim serves Anthropic Messages, OpenAI Responses, and Gemini routes that translate
+into the same internal `model_request` path as the chat route (shared `_request_model`
+seam). No Worker, SDK-type, wire, or core change. Vendor-shaped error envelopes on every
+failure; all chat-route protections (loopback-only, Host check, per-run key via Bearer /
+`x-api-key` / `x-goog-api-key` / `?key=`, 1 MiB body cap, request cap, timeout) apply to
+every route. Streaming is replay of the complete result in each vendor's SSE format.
+
+**Supported API shapes and known limits** (verified by the real-socket suites, not assumed):
+
+| Route | Tools | Streaming | Known gaps |
+|---|---|---|---|
+| `POST /v1/chat/completions` (OpenAI Chat) | yes (function; auto/none only) | yes (SSE replay; `include_usage`) | `tool_choice` required/named → 400; non-text content → 400 |
+| `POST /v1/messages` (Anthropic) | yes (`tool_use`/`tool_result`; auto/none only) | yes (documented event sequence) | `tool_choice` any/tool → 400; images → 400; `anthropic-version` required, value ignored |
+| `POST /v1/responses` (OpenAI Responses) | yes (function tools, `function_call(_output)` items) | yes (`response.*` event sequence) | `previous_response_id` → 400; hosted tools/files/images → 400; `store` ignored; `reasoning` items dropped |
+| `POST /v1beta/models/{m}:generateContent` (Gemini) | yes (`functionDeclarations`, `functionCall`/`functionResponse`) | n/a | calls addressed by name (no call ids); non-text parts → 400; `toolConfig` ANY → 400 |
+| `POST /v1beta/models/{m}:streamGenerateContent?alt=sse` | yes | yes (SSE chunks; closing chunk carries finishReason+usage) | same as generateContent; `alt` other than `sse` → 400 |
+| `GET /v1/models` / `GET /v1beta/models` | n/a | n/a | advisory only: lists the last model used, else `nervos-model`; the wire carries no per-run model allowlist to the host |
+
+Cross-route limits inherited from ADR 0042 remain: multi-turn conversations with a tool
+exchange before a later user message are refused (`model_request_rejected`), and forced
+tool choice would need a core change.
+
+- Child environment: `process_agent_environment()` sets `OPENAI_BASE_URL`(+`/v1`),
+  `ANTHROPIC_BASE_URL`, `GOOGLE_GEMINI_BASE_URL`, `NERVOS_MCP_URL`(+`/mcp`), and the
+  per-run key as `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`/`GEMINI_API_KEY`/`GOOGLE_API_KEY`.
+- Tests: `apps/worker/tests/integration/test_real_e2e_shim_vendor_routes.py` (15
+  real-socket tests: per-route tool loop, streamed text, streamed tool call, 400/401
+  vendor-shaped rejections that never reach the wire, both discovery listings, env);
+  `packages/nervos-package-host/tests/test_process_agent_environment.py`.
+- ADR: `docs/adr/0044-bridge-api-shapes.md` (Status: ACCEPTED).
+- Dependency bundling investigation (no code change):
+  `docs/adr/0043-bridge-agent-dependency-bundling.md` (Status: PROPOSED).
+
 **Files Changed**:
 - `packages/nervos-core/src/nervos_core/application/package_manifest.py`
 - `packages/nervos-core/src/nervos_core/domain/packages.py`

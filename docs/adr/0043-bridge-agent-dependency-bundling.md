@@ -1,0 +1,86 @@
+# ADR 0043 — Bridge Agent Dependency Bundling
+
+**Status: PROPOSED** — An investigation record with a recommendation. Nothing here is
+accepted or implemented; no code changed for this ADR.
+
+## Question
+
+How does a process-kind package (ADR 0041) ship its own dependencies today — a private
+Python `site-packages`, a Node `node_modules`, or a self-contained binary — and what is
+the smallest change that would support each shape?
+
+## What exists today (verified, file:line)
+
+### The package archive can already carry arbitrary files
+
+- `packages/nervos-core/src/nervos_core/application/package_builder.py:60-64` — the
+  archive layout is `agent.whl`, `manifest.yaml`, `config.schema.json`,
+  `dependencies/lock.json`, `dependencies/wheels/*.whl`, `integrity/*`.
+- `package_builder.py:99` — `PackageBuildInputs.assets: Mapping[str, Path] | None`:
+  arbitrary assets at canonical archive paths are a first-class build input
+  (`package_builder.py:91` documents the key convention).
+- `packages/nervos-core/src/nervos_core/application/package_storage.py:97-115` —
+  `PackageStore.materialize` streams **every** verified member (wheels, lock, and
+  assets alike) into the payload root, refusing traversal and overwrite.
+- `package_storage.py:128` — the installed bundle lives at
+  `packages/<package_id>/<version>/<content_digest>` inside the store.
+
+### What the sandbox mounts
+
+- `apps/worker/src/nervos_worker/package_execution.py:212-218` — for process-kind runs
+  the Worker computes that bundle root and passes it as `package_root`.
+- `packages/nervos-core/src/nervos_core/infrastructure/sandbox/linux_bubblewrap.py:139-143`
+  — the bundle is `--ro-bind`-mounted **read-only**, and for process kind it is also
+  the working directory; the scratch directory stays the only writable location.
+- `linux_bubblewrap.py:136` — the Python package environment is separately mounted
+  read-only (with its `pyvenv.cfg` validated at `linux_bubblewrap.py:72` and
+  `sandbox/__init__.py:79-81`).
+
+### Python agents already get an offline site-packages
+
+- `packages/nervos-core/src/nervos_core/application/package_environment.py:161-200` —
+  `PackageEnvironmentBuilder.build` creates a private venv
+  (`venv.EnvBuilder(with_pip=True)`, line 174) and installs, **offline**
+  (`pip install --no-index --no-deps`), the declared dependency wheelhouse plus the
+  agent wheel plus the pinned SDK and host wheels. The environment is content-addressed
+  by digest and shared across runs.
+- A `python`-kind package therefore ships library dependencies today through
+  `dependencies/wheels`; a `process`-kind package whose command is a Python program can
+  reach the same site-packages **only by invoking the environment interpreter** — the
+  child environment (`packages/nervos-package-host/src/nervos_package_host/__main__.py:229-231`,
+  built by `process_agent_environment`) does not put the venv on `PATH` or expose a
+  `PYTHON` variable.
+
+### Node agents and self-contained binaries
+
+- There is no Node support at all: no `node` runtime artifact, no `node_modules`
+  handling, and the manifest's `runtime.command` validation
+  (`packages/nervos-core/src/nervos_core/domain/packages.py` — `runtime.command` items)
+  only requires relative in-bundle paths. A Node agent that ships its own
+  `node_modules` as **assets** would have them materialized and mounted read-only —
+  but nothing provides or mounts a `node` interpreter to run it.
+- A self-contained single-file binary could be shipped as an asset today, with one gap:
+  `package_storage.py:111-115` materializes members with plain `open("xb")`, so the
+  POSIX executable bit is **not** preserved from the archive; a `runtime.command` whose
+  first item is such a file would fail with `EACCES` on Linux.
+
+## Recommendation (smallest additive change)
+
+1. **Exec bit**: at materialization, mark process-kind command targets (or every
+   payload member under a `bin/` prefix) executable. One flag on the archive entry
+   (builder already controls member metadata) plus one `chmod` in
+   `PackageStore.materialize`. This is the single unlock for self-contained binaries
+   and for `bin/agent`-style wrappers.
+2. **Python interpreter for process kind**: export one variable (for example
+   `NERVOS_PACKAGE_PYTHON`) pointing at the read-only package environment's
+   interpreter in `process_agent_environment`, so a Python foreign agent's command can
+   be `["bin/agent.sh"]` (or the command may reference `$NERVOS_PACKAGE_PYTHON`) and
+   get the same offline site-packages `python`-kind packages use. No new install step.
+3. **Node (bigger, optional)**: a Node runtime artifact analogous to the SDK wheel —
+   downloaded/verified once into the store and `--ro-bind` mounted like the Python
+   environment — plus `NERVOS_PACKAGE_NODE` in the child environment. `node_modules`
+   needs no support of its own: assets already carry it read-only.
+
+Items 1 and 2 are additive, manifest-compatible, and need no Worker/core/wire change.
+Item 3 adds a new runtime artifact kind and is the only piece that touches
+installation machinery. None of this is implemented by ADR 0044.
