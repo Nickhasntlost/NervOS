@@ -14,10 +14,10 @@ so an unknown or node-local identifier fails closed at parse time.
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from pathlib import PureWindowsPath
 from types import MappingProxyType
 from typing import cast
 
@@ -317,9 +317,14 @@ def _parse_command(command_list: list[object]) -> tuple[str, ...]:
         if len(item) > MAX_COMMAND_ITEM_CHARS:
             msg = f"runtime.command[{i}] exceeds {MAX_COMMAND_ITEM_CHARS} characters"
             raise InvalidPackageManifest(msg)
-        if os.path.isabs(item):
+        if (
+            item.startswith(("/", "\\"))
+            or PureWindowsPath(item).is_absolute()
+            or bool(PureWindowsPath(item).drive)
+            or bool(PureWindowsPath(item).root)
+        ):
             raise InvalidPackageManifest(f"runtime.command[{i}] must not be an absolute path")
-        if ".." in item.split(os.sep) or (os.altsep and ".." in item.split(os.altsep)):
+        if ".." in item.replace("\\", "/").split("/"):
             raise InvalidPackageManifest(f"runtime.command[{i}] must not contain '..'")
         result.append(item)
     return tuple(result)

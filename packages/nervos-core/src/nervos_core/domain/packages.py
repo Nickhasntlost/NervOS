@@ -9,11 +9,11 @@ declarations are inert values a later milestone may read.
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import total_ordering
+from pathlib import PureWindowsPath
 
 from nervos_core.domain.agents import AGENT_KEY_PATTERN, MAX_AGENT_KEY_LENGTH, AgentDefinitionId
 from nervos_core.domain.runs import RunLimits
@@ -275,9 +275,14 @@ class PackageRuntime:
                 msg = "runtime.language, python, entrypoint must be empty for process kind"
                 raise InvalidPackageManifest(msg)
             for item in self.command:
-                if os.path.isabs(item):
+                if (
+                    item.startswith(("/", "\\"))
+                    or PureWindowsPath(item).is_absolute()
+                    or bool(PureWindowsPath(item).drive)
+                    or bool(PureWindowsPath(item).root)
+                ):
                     raise InvalidPackageManifest("runtime.command items must not be absolute paths")
-                if ".." in item.split(os.sep) or (os.altsep and ".." in item.split(os.altsep)):
+                if ".." in item.replace("\\", "/").split("/"):
                     raise InvalidPackageManifest("runtime.command items must not contain '..'")
                 if len(item) > MAX_COMMAND_ITEM_CHARS:
                     msg = (

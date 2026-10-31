@@ -87,7 +87,7 @@ class TestBwrapArgumentList:
                 # Find the specific mount for this root
                 found = False
                 for i in range(len(cmd) - 2):
-                    if cmd[i] == "--ro-bind" and cmd[i + 1] == str(Path(root).resolve()):
+                    if cmd[i] == "--ro-bind" and cmd[i + 1] in (str(root), str(Path(root).resolve())):
                         found = True
                         break
                 assert found, f"Expected --ro-bind for {root}"
